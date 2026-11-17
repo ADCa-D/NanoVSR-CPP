@@ -116,6 +116,29 @@ class Handler(BaseHTTPRequestHandler):
         if path in ("/", "/index.html"):
             with open(os.path.join(HERE, "webui.html"), "rb") as f:
                 return self._send(200, f.read(), "text/html; charset=utf-8")
+        if path == "/health":
+            import socket
+            ok = {"webui": "ok"}
+            # EasyTier 网卡是否存在
+            try:
+                ok["ethernet"] = "ok" if socket.gethostbyname_ex(socket.gethostname())[2] else "unknown"
+            except Exception:
+                ok["ethernet"] = "unknown"
+            import subprocess as sp
+            try:
+                out = sp.run(["powershell", "-NoProfile", "-Command",
+                              "(Get-NetIPAddress -IPAddress 66.66.66.67 -ErrorAction SilentlyContinue) -ne $null"],
+                             capture_output=True, text=True, timeout=5).stdout.strip().lower()
+                ok["easytier_ip"] = "ok" if out == "true" else "missing"
+            except Exception:
+                ok["easytier_ip"] = "unknown"
+            try:
+                s = socket.create_connection(("66.66.66.67", 7861), timeout=2)
+                s.close()
+                ok["forwarder"] = "ok"
+            except Exception:
+                ok["forwarder"] = "dead"
+            return self._send(200, json.dumps(ok, ensure_ascii=False).encode())
         if path == "/api/status":
             q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             jid = q.get("id", [""])[0]
@@ -136,7 +159,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(404, b'{"error":"missing"}')
             size = os.path.getsize(fn)
             self.send_response(200)
-            self.send_header("Content-Type", "video/mp4")
+            self.send_header("Content-Type", "image/png" if fn.lower().endswith(".png") else "video/mp4")
             self.send_header("Content-Length", str(size))
             self.send_header("Content-Disposition",
                              f'attachment; filename="{os.path.basename(fn)}"')
@@ -173,10 +196,12 @@ class Handler(BaseHTTPRequestHandler):
             if model not in ("644k", "1.7m", "5.4m"):
                 model = "1.7m"
             limit = int(q.get("limit", ["0"])[0] or 0)
-            out_path = os.path.join(work, "out.mp4")
+            is_img = os.path.splitext(name)[1].lower() in (
+                ".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff")
+            out_path = os.path.join(work, "out.png" if is_img else "out.mp4")
             ffprobe = os.path.join(os.path.dirname(ARGS.ffmpeg), "ffprobe.exe")
             job = dict(state="running", frames=0, out=out_path, t0=time.time(), preset=preset,
-                       total=probe_frames(ffprobe, in_path),
+                       total=(1 if is_img else probe_frames(ffprobe, in_path)),
                        name=name, model=model)
             JOBS[jid] = job
             threading.Thread(target=run_job, args=(jid, in_path, out_path, preset, model, limit),

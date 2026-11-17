@@ -459,7 +459,21 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::printf("nanovsr build %s %s\n", __DATE__, __TIME__);
-    std::printf("输入: %s  %dx%d  %.3f fps\n", in_path.c_str(), W, H, fps);
+    auto has_ext = [](const std::string& p, std::initializer_list<const char*> exts) {
+        std::string low = p;
+        for (auto& ch : low) ch = (char)std::tolower((unsigned char)ch);
+        for (auto e : exts)
+            if (low.size() > std::strlen(e) && low.compare(low.size() - std::strlen(e), std::strlen(e), e) == 0)
+                return true;
+        return false;
+    };
+    const bool in_is_image = has_ext(in_path, {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"});
+    if (in_is_image) {
+        if (limit == 0) limit = 1;                 // 单帧模式
+        std::printf("输入: %s  %dx%d  (单帧图片)\n", in_path.c_str(), W, H);
+    } else {
+        std::printf("输入: %s  %dx%d  %.3f fps\n", in_path.c_str(), W, H, fps);
+    }
 
     // 4x 后超过 4K（H.264 上限）就先按整数倍降采样：1080p -> /2 -> 960x540 -> 4x -> 3840x2160
     int pre = 1;
@@ -911,12 +925,19 @@ int main(int argc, char** argv) {
             std::printf("  编码器 %s 不可用，跳过\n", c.name);
         }
         if (venc.empty()) venc = "-c:v libx264 -crf " + qof("x264") + " -preset veryfast";
+        const bool out_is_image = has_ext(out_path, {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"});
+        std::string pix_tail = " -pix_fmt yuv420p";
+        if (out_is_image) {
+            venc = has_ext(out_path, {".png"}) ? "-c:v png" : "-c:v mjpeg -q:v 2";
+            pix_tail = " -pix_fmt rgb24 -frames:v 1";
+            enc_scale.clear();
+        }
         std::printf("编码器: %s\n", venc.c_str());
         char cmd[2048];
         std::snprintf(cmd, sizeof(cmd),
                       "\"%s\" -v error -y -f rawvideo -pix_fmt rgb24 -s %dx%d -r %.6f -i - "
-                      "%s%s -pix_fmt yuv420p \"%s\"",
-                      ffmpeg.c_str(), W * 4, H * 4, fps, venc.c_str(), enc_scale.c_str(),
+                      "%s%s%s \"%s\"",
+                      ffmpeg.c_str(), W * 4, H * 4, fps, venc.c_str(), enc_scale.c_str(), pix_tail.c_str(),
                       out_path.c_str());
         fout = popen_w(cmd);
         if (!fout) {
