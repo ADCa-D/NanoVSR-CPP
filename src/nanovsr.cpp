@@ -786,7 +786,7 @@ int main(int argc, char** argv) {
     auto run_conv64 = [&](const std::string& name, Buf& in, VkDeviceSize in_off, Buf& out,
                           VkDeviceSize out_off, int h, int w, int O, float slope, bool out_f16 = false) {
         const WLayer& L = layers[idx[name]];
-        if (L.cm_off >= 0 && O % 64 == 0) {
+        if (L.cm_off >= 0) {
             VkDescriptorBufferInfo dbi[4] = {{in.buf, in_off, VK_WHOLE_SIZE},
                                              {bwcm.buf, (VkDeviceSize)L.cm_off, VK_WHOLE_SIZE},
                                              {bw.buf, L.b_off, VK_WHOLE_SIZE},
@@ -796,9 +796,10 @@ int main(int argc, char** argv) {
             pc.H = h;
             pc.W = w;
             pc.O = O;
+            pc.k = (O + 63) / 64 * 64;      // 权重里输出通道补齐后的跨度（张量核按 64 一组）
             pc.slope = slope;
             g.dispatch(out_f16 ? pConvCM16 : pConvCM, dbi, pc, (uint32_t)((w + 31) / 32),
-                       (uint32_t)((h + 3) / 4), (uint32_t)(O / 64));
+                       (uint32_t)((h + 3) / 4), (uint32_t)((O + 63) / 64));
             return;
         }
         VkDescriptorBufferInfo dbi[4] = {{in.buf, in_off, VK_WHOLE_SIZE},

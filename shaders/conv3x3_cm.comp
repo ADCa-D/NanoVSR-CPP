@@ -21,6 +21,8 @@ const int TH = 4;         // tile 高
 #define C_OVERRIDE 64
 #endif
 const int C = C_OVERRIDE;    // 输入通道（按模型 num_feat 编译变体）
+// shared tile 的通道跨度补齐到 32 half（64 字节），保证 coopMatLoad 的 32B 行对齐
+const int CPAD = (C + 31) & ~31;
 const int SW = TW + 2;    // 34（含 halo）
 const int SH = TH + 2;    // 6
 
@@ -42,7 +44,7 @@ layout(push_constant) uniform P {
     int k;
 } p;
 
-shared float16_t s_in[SH * SW * C];
+shared float16_t s_in[SH * SW * CPAD];
 shared float s_out[8 * 256];
 
 const int RM = gl_CooperativeMatrixLayoutRowMajor;
@@ -63,7 +65,7 @@ void main() {
         const int gx = base.x + px - 1;
         float v = 0.0;
         if (gy >= 0 && gy < p.H && gx >= 0 && gx < p.W) v = x[(gy * p.W + gx) * C + c];
-        s_in[pix * C + c] = float16_t(v);
+        s_in[pix * CPAD + c] = float16_t(v);
     }
     barrier();
 
@@ -83,16 +85,17 @@ void main() {
         const int ky = tap / 3, kx = tap % 3;
         for (int cc = 0; cc < C / 16; ++cc) {
             coopmat<float16_t, 16, 16, 16, gl_MatrixUseB> fb;
-            coopMatLoad(fb, w, (((tap * (C / 16) + cc) * (p.ON >> 4)) + (oc0 >> 4)) * 256, 16, RM);
-            const int r0 = ((row0 + 0 + ky) * SW + (0 + kx)) * C + cc * 16;
-            const int r1 = ((row0 + 0 + ky) * SW + (16 + kx)) * C + cc * 16;
-            const int r2 = ((row0 + 1 + ky) * SW + (0 + kx)) * C + cc * 16;
-            const int r3 = ((row0 + 1 + ky) * SW + (16 + kx)) * C + cc * 16;
+            const int WSTRIDE = (p.k > 0) ? p.k : p.ON;   // 权重里 O 可能被补齐到 64 的倍数
+            coopMatLoad(fb, w, (((tap * (C / 16) + cc) * (WSTRIDE >> 4)) + (oc0 >> 4)) * 256, 16, RM);
+            const int r0 = ((row0 + 0 + ky) * SW + (0 + kx)) * CPAD + cc * 16;
+            const int r1 = ((row0 + 0 + ky) * SW + (16 + kx)) * CPAD + cc * 16;
+            const int r2 = ((row0 + 1 + ky) * SW + (0 + kx)) * CPAD + cc * 16;
+            const int r3 = ((row0 + 1 + ky) * SW + (16 + kx)) * CPAD + cc * 16;
             coopmat<float16_t, 16, 16, 16, gl_MatrixUseA> fa0, fa1, fa2, fa3;
-            coopMatLoad(fa0, s_in, r0, C, RM);
-            coopMatLoad(fa1, s_in, r1, C, RM);
-            coopMatLoad(fa2, s_in, r2, C, RM);
-            coopMatLoad(fa3, s_in, r3, C, RM);
+            coopMatLoad(fa0, s_in, r0, CPAD, RM);
+            coopMatLoad(fa1, s_in, r1, CPAD, RM);
+            coopMatLoad(fa2, s_in, r2, CPAD, RM);
+            coopMatLoad(fa3, s_in, r3, CPAD, RM);
             a0 = coopMatMulAdd(fa0, fb, a0);
             a1 = coopMatMulAdd(fa1, fb, a1);
             a2 = coopMatMulAdd(fa2, fb, a2);
@@ -115,7 +118,7 @@ void main() {
             const int oc = i - pl * 16;
             const int gx = base.x + px0 + pl;
             const int ch = oc0 + oc;
-            if (gx < p.W && oy < p.H) {
+            if (gx < p.W && oy < p.H && ch < p.ON) {
                 float v = s_out[warp * 256 + i] + b[ch];
                 if (p.slope > 0.0 && v < 0.0) v *= p.slope;
                 #ifdef OUT_F16

@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """把导出权重打包成 C++ 运行时布局，并生成整模型参考输出（分阶段）。
 
 运行时布局（所有 conv 统一）：
@@ -100,8 +100,14 @@ def main():
             continue
         wc = np.ascontiguousarray(w.transpose(2, 3, 1, 0).reshape(kh * kw * C, O))  # [tap*C][O]
         # 张量核友好布局：[tap][16通道块][16输出通道块][k][n]，每个 16x16 块连续
-        wc = np.ascontiguousarray(
-            wc.reshape(9, C // 16, 16, O // 16, 16).transpose(0, 1, 3, 2, 4))
+        wc = wc.reshape(9, C // 16, 16, O // 16, 16).transpose(0, 1, 3, 2, 4)
+        # 输出通道补齐到 64 的倍数：张量核每个 workgroup 固定算 64 个 oc
+        if O % 64:
+            ncg = (O + 63) // 64 * 4
+            pad = np.zeros((9, C // 16, ncg, 16, 16), np.float16)
+            pad[:, :, : O // 16] = wc
+            wc = pad
+        wc = np.ascontiguousarray(wc)
         cm_blob += b'\0' * (-len(cm_blob) % 256)
         off = len(cm_blob)
         cm_blob += wc.astype(np.float16).tobytes()
