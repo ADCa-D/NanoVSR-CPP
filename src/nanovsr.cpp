@@ -579,6 +579,9 @@ int main(int argc, char** argv) {
     const size_t F = (size_t)nf_;
     const int nb = nb_;
     std::printf("模型: num_feat=%d, blocks=%d\n", (int)F, nb);
+    if (std::string(model_dir).find("1.7m") == std::string::npos) {
+        std::printf("!! 警告: 644k / 5.4m 的 C!=64 路径尚未验证（与 torch 差 ~32 dB），仅供实验\n");
+    }
 
     const float act = 0.1f;
 
@@ -996,8 +999,8 @@ int main(int argc, char** argv) {
                 {bw.buf, 0, 1},
                 {bcat.buf, 0, VK_WHOLE_SIZE}};
             Push pc;
-            pc.C_ = 64;
-            pc.H = 64;
+            pc.C_ = (int32_t)F;          // 前向特征通道数（不是固定的 64）
+            pc.H = (int32_t)F;           // 反向特征通道数
             pc.W = (int32_t)px;
             g.dispatch(pCat, dbi, pc, (uint32_t)((px + 63) / 64));
 
