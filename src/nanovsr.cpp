@@ -524,6 +524,24 @@ int main(int argc, char** argv) {
     }
 
     // ---- 模型清单 ----
+    // 权重与 shader 的启动检查：下载发布包的人通常没有权重，要给出可操作的提示
+    {
+        std::ifstream test(model_dir + "/weights_rt.json");
+        if (!test.good()) {
+            std::printf("\n找不到模型权重: %s\\weights_rt.{bin,json}\n\n", model_dir.c_str());
+            std::printf("本程序不附带权重（版权属于 NanoVSR 作者）。三步准备：\n");
+            std::printf("  1) 下载官方 checkpoint（nanovsr_1.7m.pth 等）\n");
+            std::printf("  2) python pack_model.py --tag 1.7m --out models_rt\\\\nanovsr_1.7m --weights-only\n");
+            std::printf("  3) 确认 exe 旁边有 models_rt\\\\nanovsr_1.7m\\\\ 下三个文件\n");
+            std::printf("详见仓库里的 models/README.md\n");
+            return 2;
+        }
+        std::ifstream tsh("shaders/conv3x3_cm_64.spv");
+        if (!tsh.good()) {
+            std::printf("\n找不到 shader: shaders/*.spv（需要先运行 build.bat 编译）\n");
+            return 2;
+        }
+    }
     auto jraw = read_file(model_dir + "/weights_rt.json");
     std::string js(jraw.begin(), jraw.end());
     auto jint = [&](const std::string& key, size_t from) {
