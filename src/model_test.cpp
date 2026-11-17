@@ -499,7 +499,8 @@ int main(int argc, char** argv) {
                           VkDeviceSize out_off, int h, int w, float slope) {
         const WLayer& L = layers[idx[name]];
         const int O = L.O;          // 输出通道一律来自清单，别在外面写死
-        if (L.cm_off >= 0) {
+        // k==1（fusion）走张量核需要额外的流式内核，本工具没接；退回 SIMT 即可
+        if (L.cm_off >= 0 && L.k == 3) {
             // 张量核路径：权重 [tap][cc][ocg][k][n] f16，O 补齐到 64 的倍数
             VkDescriptorBufferInfo dbi[4] = {{in.buf, in_off, VK_WHOLE_SIZE},
                                              {bwcm.buf, (VkDeviceSize)L.cm_off, VK_WHOLE_SIZE},
@@ -512,7 +513,7 @@ int main(int argc, char** argv) {
             pc.O = O;
             pc.slope = slope;
             pc.k = (O + 63) / 64 * 64;
-            g.dispatch(cm_pipe(L.C), dbi, pc, (uint32_t)((w + 31) / 32), (uint32_t)((h + 3) / 4),
+            g.dispatch(cm_pipe(L.C), dbi, pc, (uint32_t)((w + 15) / 16), (uint32_t)((h + 7) / 8),
                        (uint32_t)((O + 63) / 64));
             return;
         }

@@ -10,8 +10,9 @@ NanoVSR 4× 视频超分的 **C++ / Vulkan compute** 实现 —— 不依赖 PyT
 | 项 | 结果 |
 |---|---|
 | 数值 | 与 PyTorch 逐级对拍：单层 maxdiff 5e-6，整模型最终 8bit 输出**最大差 1 级、0 通道越界** |
-| 速度（480p→1080p） | 2.3 fps（含 AV1 编码），纯推理 52.9 ms/帧 |
-| 速度（1080p→4K） | ~0.45 fps（模型 4× 跑满后缩到交付尺寸） |
+| 速度（480p 输入，4× 输出 3416×1920） | 644k 7.7 / 1.7m 5.1 / 5.4m 1.3 fps（含 AV1 编码） |
+| 速度（1080p→4K，内部按 1024×576 跑 4×） | 644k 4.8 / 1.7m 3.0 / 5.4m 0.9 fps |
+| 速度（300p 输入） | 644k 26.6 / 1.7m 16.7 fps |
 | 依赖 | MSVC + 系统 `vulkan-1.dll` + glslang（12 MB 单文件） |
 
 ## 构建
@@ -47,6 +48,9 @@ python pack_model.py --tag 1.7m --out models_rt\nanovsr_1.7m --weights-only
 
 会生成 `weights_rt.bin/json`（SIMT/小通道用）与 `weights_cm.bin`（张量核分块布局，f16）。
 
+程序先找 `models_rt/nanovsr_<size>`，找不到再找 `models/models_rt/nanovsr_<size>`（发布包布局）；
+连请求的那一档都没装时，会自动改用已装的任意一档，并在启动时打印 `权重目录: ...`，不用敲 `--model` 绝对路径。
+
 ## 用法
 
 ```bat
@@ -61,6 +65,15 @@ nanovsr.exe --in a.mp4 --out b.mp4 --model-size 644k|1.7m|5.4m
 python webui.py --port 7861
 ```
 
+### Web 面板
+
+- 拖入视频或图片即可跑；模型、档位、chunk（0–30）、tile、crf、限帧都能逐项覆盖，
+  留空或填 0 / -1 表示跟随档位。
+- **音轨与字幕原样接回**：内核先出纯视频，随后用 `-c copy` 把源文件的音频、字幕轨
+  回封装（带字幕 → `.mkv`；音轨装不进 mp4 时自动转 aac 192k）。
+- 历史记录持久化在 `work/history.json`，可单条删除、可一键清空（连结果文件一起删）；
+  结果支持 Range 请求，页面里能直接拖动进度条预览。
+
 主要参数：
 
 | 参数 | 默认 | 说明 |
@@ -71,6 +84,10 @@ python webui.py --port 7861
 | `--max-out` | 4k | 输出像素上限：4k(8.9Mp) / 8k(33.2Mp) |
 | `--budget GB` | 驱动建议×0.8 | 显存预算，决定分块大小 |
 | `--tile WxH` | 自动 | 手动指定空间分块 |
+| `--ov N` | 2×(blocks+4) | tile 重叠像素（每边 N/2），必须 ≥ 感受野；调小更快但会有接缝 |
+| `--no-seg` | 关（默认分段） | 关掉分段落盘：回到单个长管道，进程被杀就整段白跑 |
+| `--seg-chunks K` | 4 | 几个 chunk 写一个分段文件（段末做帧数校验；段太小编码器启动开销会拖慢小 chunk） |
+| `--keep-parts` | 关 | 拼接成功后仍保留 `<out>.parts/`（取证/调试） |
 | `--codec` | auto | auto / libsvtav1 / libx265 / libx264 |
 | `--downscale` | lanczos | 预缩放算法（lanczos/swscale 或 libplacebo 核） |
 
@@ -79,8 +96,11 @@ python webui.py --port 7861
 - **张量核卷积**：`VK_KHR_cooperative_matrix`，16×16×16 f16、f32 累加。
   不做 im2col —— A 片段直接从 shared 中的 halo tile 按 tap 偏移读取。
   按输出通道切 warp 使每层权重流量从 601 MB 降到 150 MB。
+- **1×1 张量核内核**：`conv1x1_cm.comp` 专给 fusion 用。3×3 版要把整块 halo tile 放 shared，
+  C=192（5.4m 的 fusion 是 2F）要 72 KB 直接超设备上限；1×1 版按 16 通道流式载入，
+  shared 恒定 16 KB，任何 C 都装得下。
 - **空间分块**：按显存账本（每像素静态 9.2 KB + 每帧 0.89 KB）搜索总处理量最小的
-  tile 形状，块间重叠 96（覆盖 40 层卷积 ±42 的接收野），只合成中心区。
+  tile 形状，块间重叠 `2×(blocks+4)`（覆盖每条链 ±(blocks+4) 的接收野），只合成中心区。
 - **超分链路**：feat → 20 层前向 → 20 层反向（逐帧递推）→ fusion → 两级 PixelShuffle
   → conv_last → 4× 双线性残差 → u8。
 - **视频管道**：ffmpeg 解码 → GPU → 推理 → 打包 u8 → 编码；CPU/GPU 之间走
@@ -88,7 +108,7 @@ python webui.py --port 7861
 
 ## 已知限制
 
-- 1080p 输入在 4K 上限下需要 21 个 tile，约 0.45 fps。
+- 1080p 输入在 4K 上限下需要 6~8 个 tile（重叠自适应后），1.7m 约 3 fps。
 - 8K 输出需要 `--max-out 8k --codec libx265`（NVENC 因驱动 NVENC API 13.0 < 13.1 不可用）。
 - 1.7m 在近奈奎斯特条纹（如细纹理衣领）上会出现摩尔纹 —— 已确认是模型行为
   （与 torch 输出一致，PSNR 48.4 dB）。

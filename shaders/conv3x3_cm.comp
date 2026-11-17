@@ -1,36 +1,43 @@
 #version 450
-// 张量核版 3x3 卷积（C=64, O=64，NHWC）。
+// 张量核版 3x3 卷积（NHWC，f32 入 / f32 或 f16 出）。
 //
-// 分工（第三版：按输出通道切 warp，把权重流量压到 1/4）：
-//   workgroup = 8 warp（256 线程），tile = 32x4 = 128 个像素。
-//   warp w -> oc 组 = w % 4（16 个输出通道），像素块 = w / 4（每块 2 行 x 2 个半行）
-//   每个 warp 在自己的 64 个像素上算 16 个输出通道，B 片段只加载 36 次（而不是 144 次）。
+// 分块思路来自 llama.cpp ggml-vulkan 的 mul_mm.comp（KHR_cooperative_matrix GEMM）：
+//   一个 warp 覆盖一行像素（TW 个）x 全部 64 个输出通道 -> 每轮 (tap, cc) 做
+//   (TW/16) x 4 次 mma，A 片段被 4 个 B 片段复用。
+//   workgroup = TH 个 warp（每 warp 一行），tile = TW x TH 个像素，z 维切输出通道。
+//   权重按 workgroup 协作搬进 shared（双缓冲 + 下一轮预取），所有 warp 共用一份。
 //
-// 输入输出整体仍是 f32，只在载入 shared tile 时转 f16。
-// glslang 的 KHR 签名是「数组 + 元素偏移」：coopMatLoad(out m, buf[], elemOff, stride, layout)
+// 关键经验：halo 放 shared 后 shared 用量决定「每个 SM 能驻留几个 workgroup」，
+// 而这个小卷积是 occupancy 受限的 —— TW 从 32 降到 16（共享减半、可驻留 2 块）反而快 29%，
+// 尽管片段/mma 比从 0.75 退回 1.25。所以 TW/TH 要按 shared 预算调，不是越大越好。
 #extension GL_KHR_cooperative_matrix : require
 #extension GL_KHR_memory_scope_semantics : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : enable
 
-layout(local_size_x = 256) in;
+const int TW = 16;        // tile 宽（像素），必须是 16 的倍数
+const int TH = 8;         // tile 高 = warp 数
+#define NT (32 * TH)
+layout(local_size_x = NT) in;
 
-const int TW = 32;        // tile 宽（像素）
-const int TH = 4;         // tile 高
 #ifndef C_OVERRIDE
 #define C_OVERRIDE 64
 #endif
 const int C = C_OVERRIDE;    // 输入通道（按模型 num_feat 编译变体）
-// shared tile 的通道跨度补齐到 32 half（64 字节），保证 coopMatLoad 的 32B 行对齐
-const int CPAD = (C + 31) & ~31;
-const int SW = TW + 2;    // 34（含 halo）
-const int SH = TH + 2;    // 6
+// 行步长若正好是 128 字节的整数倍，各行会落在同一组 bank 上，所以这种时候加 16 个 half
+const int CPAD0 = (C + 31) & ~31;
+const int CPAD = (CPAD0 * 2) % 128 == 0 ? CPAD0 + 16 : CPAD0;
+const int SW = TW + 2;    // 含 halo
+const int SH = TH + 2;
+const int OCB = 64;       // 每个 workgroup 覆盖的输出通道数
+const int NW = TW / 16;   // 每个 warp 的 A 片段数（像素块）
 
 layout(binding = 0) readonly buffer X  { float x[]; };        // [H,W,C] f32
 layout(binding = 1) readonly buffer Wt { float16_t w[]; };    // [tap][C][O] f16
 layout(binding = 2) readonly buffer Bs { float b[]; };        // [O]
 #ifdef OUT_F16
-layout(binding = 3) writeonly buffer Y { float16_t y[]; };   // [H,W,O] f16（省一半带宽/显存）
+layout(binding = 3) writeonly buffer Y { float16_t y[]; };   // [H,W,O] f16
 #else
 layout(binding = 3) writeonly buffer Y { float y[]; };       // [H,W,O] f32
 #endif
@@ -45,9 +52,19 @@ layout(push_constant) uniform P {
 } p;
 
 shared float16_t s_in[SH * SW * CPAD];
-shared float s_out[8 * 256];
+shared float16_t s_w[2 * OCB * 16];
+shared float s_out[TH * 256];
 
 const int RM = gl_CooperativeMatrixLayoutRowMajor;
+
+// 把第 idx 个 (tap, cc) 的 64 个输出通道权重搬到 shared 的第 buf 块。
+// 权重布局是 [tile16oc][k16] 连续的，64 通道正好 4 个连续 tile，顺序拷贝即可。
+void stage_w(int idx, int buf, int wrow, int tilebase) {
+    const int wb = (idx * wrow + tilebase) * 256;
+    for (int i = int(gl_LocalInvocationID.x); i < OCB * 16; i += NT) {
+        s_w[buf * (OCB * 16) + i] = w[wb + i];
+    }
+}
 
 void main() {
     const int tid = int(gl_LocalInvocationID.x);
@@ -56,7 +73,7 @@ void main() {
     const ivec2 base = ivec2(gl_WorkGroupID.xy) * ivec2(TW, TH);
 
     // ---- 1) 载入 halo tile（f32 -> f16），零填充 ----
-    for (int i = tid; i < SH * SW * C; i += 256) {
+    for (int i = tid; i < SH * SW * C; i += NT) {
         const int c = i % C;
         const int pix = i / C;
         const int py = pix / SW;
@@ -67,13 +84,13 @@ void main() {
         if (gy >= 0 && gy < p.H && gx >= 0 && gx < p.W) v = x[(gy * p.W + gx) * C + c];
         s_in[pix * CPAD + c] = float16_t(v);
     }
-    barrier();
 
-    const int ocbase = int(gl_WorkGroupID.z) * 64;   // O>64 时用 z 维分段
-    const int og = warp & 3;             // 0..3 -> 输出通道块
-    const int pb = warp >> 2;            // 0..1 -> 像素块（2 行）
-    const int oc0 = ocbase + og * 16;
-    const int row0 = pb * 2;             // tile 内起始行
+    const int ocbase = int(gl_WorkGroupID.z) * OCB;   // O>64 时用 z 维分段
+    const int row0 = warp;                           // 每个 warp 一行像素
+    const int NCC = C / 16;
+    const int WSTRIDE = (p.k > 0) ? p.k : p.ON;      // 权重里 O 可能被补齐到 64 的倍数
+    const int wrow = WSTRIDE >> 4;
+    const int tilebase = ocbase >> 4;
 
     coopmat<float, 16, 16, 16, gl_MatrixUseAccumulator> a0 =
         coopmat<float, 16, 16, 16, gl_MatrixUseAccumulator>(0.0);
@@ -81,42 +98,50 @@ void main() {
     coopmat<float, 16, 16, 16, gl_MatrixUseAccumulator> a2 = a0;
     coopmat<float, 16, 16, 16, gl_MatrixUseAccumulator> a3 = a0;
 
-    for (int tap = 0; tap < 9; ++tap) {
-        const int ky = tap / 3, kx = tap % 3;
-        for (int cc = 0; cc < C / 16; ++cc) {
-            coopmat<float16_t, 16, 16, 16, gl_MatrixUseB> fb;
-            const int WSTRIDE = (p.k > 0) ? p.k : p.ON;   // 权重里 O 可能被补齐到 64 的倍数
-            coopMatLoad(fb, w, (((tap * (C / 16) + cc) * (WSTRIDE >> 4)) + (oc0 >> 4)) * 256, 16, RM);
-            const int r0 = ((row0 + 0 + ky) * SW + (0 + kx)) * CPAD + cc * 16;
-            const int r1 = ((row0 + 0 + ky) * SW + (16 + kx)) * CPAD + cc * 16;
-            const int r2 = ((row0 + 1 + ky) * SW + (0 + kx)) * CPAD + cc * 16;
-            const int r3 = ((row0 + 1 + ky) * SW + (16 + kx)) * CPAD + cc * 16;
-            coopmat<float16_t, 16, 16, 16, gl_MatrixUseA> fa0, fa1, fa2, fa3;
-            coopMatLoad(fa0, s_in, r0, CPAD, RM);
-            coopMatLoad(fa1, s_in, r1, CPAD, RM);
-            coopMatLoad(fa2, s_in, r2, CPAD, RM);
-            coopMatLoad(fa3, s_in, r3, CPAD, RM);
-            a0 = coopMatMulAdd(fa0, fb, a0);
-            a1 = coopMatMulAdd(fa1, fb, a1);
-            a2 = coopMatMulAdd(fa2, fb, a2);
-            a3 = coopMatMulAdd(fa3, fb, a3);
-        }
+    // ---- 2) 逐 (tap, cc) 累加 ----
+    const int NK = 9 * NCC;
+    int cur = 0;
+    stage_w(0, 0, wrow, tilebase);
+    barrier();                       // s_in 与 s_w[0] 就绪
+    for (int nk = 0; nk < NK; ++nk) {
+        const int tap = nk / NCC;
+        const int cc = nk - tap * NCC;
+        const int ky = tap / 3;
+        const int kx = tap - ky * 3;
+        if (nk + 1 < NK) stage_w(nk + 1, cur ^ 1, wrow, tilebase);
+
+        coopmat<float16_t, 16, 16, 16, gl_MatrixUseB> fb0, fb1, fb2, fb3;
+        coopMatLoad(fb0, s_w, cur * (OCB * 16) +   0, 16, RM);
+        coopMatLoad(fb1, s_w, cur * (OCB * 16) + 256, 16, RM);
+        coopMatLoad(fb2, s_w, cur * (OCB * 16) + 512, 16, RM);
+        coopMatLoad(fb3, s_w, cur * (OCB * 16) + 768, 16, RM);
+
+        const int r0 = ((row0 + ky) * SW + (0 + kx)) * CPAD + cc * 16;
+        coopmat<float16_t, 16, 16, 16, gl_MatrixUseA> fa0;
+        coopMatLoad(fa0, s_in, r0, CPAD, RM);
+        a0 = coopMatMulAdd(fa0, fb0, a0);
+        a1 = coopMatMulAdd(fa0, fb1, a1);
+        a2 = coopMatMulAdd(fa0, fb2, a2);
+        a3 = coopMatMulAdd(fa0, fb3, a3);
+
+        barrier();                   // 本轮读完 s_w[cur]，下一轮已写入 s_w[cur^1]
+        cur ^= 1;
     }
 
-    // ---- 2) 4 个片段依次落盘（bias + LeakyReLU）----
+    // ---- 3) 4 个片段依次落盘（bias + LeakyReLU）----
+    // 每个 warp 只读写自己那 256 个 float，跨 warp 无数据交换 -> 只需 subgroup 屏障。
+    const int oy = base.y + row0;
     for (int g = 0; g < 4; ++g) {
         if (g == 0) coopMatStore(a0, s_out, warp * 256, 16, RM);
         if (g == 1) coopMatStore(a1, s_out, warp * 256, 16, RM);
         if (g == 2) coopMatStore(a2, s_out, warp * 256, 16, RM);
         if (g == 3) coopMatStore(a3, s_out, warp * 256, 16, RM);
-        barrier();
-        const int row = row0 + (g >> 1);
-        const int px0 = (g & 1) * 16;
-        const int oy = base.y + row;
+        subgroupBarrier();
+        const int oc0 = ocbase + g * 16;
         for (int i = lane; i < 256; i += 32) {
             const int pl = i / 16;
             const int oc = i - pl * 16;
-            const int gx = base.x + px0 + pl;
+            const int gx = base.x + pl;
             const int ch = oc0 + oc;
             if (gx < p.W && oy < p.H && ch < p.ON) {
                 float v = s_out[warp * 256 + i] + b[ch];
@@ -128,6 +153,6 @@ void main() {
 #endif
             }
         }
-        barrier();
+        subgroupBarrier();
     }
 }

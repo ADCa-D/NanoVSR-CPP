@@ -94,10 +94,8 @@ src/
   nanovsr.cpp            主程序：ffmpeg 管道 + 模型调度 + staging 拷贝
   bench_model.cpp        纯测速（分阶段计时，带预热轮）
   model_test.cpp         逐级对拍（读 testrun_*/ 的参考 bin）
-  bench_conv_test.cpp*   单层卷积验证（早期）   (*=vk_conv_test.cpp)
   vk_info.cpp / vk_cm_info.cpp   设备能力探测
 pack_model.py            权重打包（三种布局）+ 生成参考输出
-make_testdata_nhwc.py    单层测试向量
 models_rt/nanovsr_1.7m/  weights_rt.bin/json（SIMT 布局）+ weights_cm.bin（张量核布局）
 webui.py / webui.html    Web 面板
 ```

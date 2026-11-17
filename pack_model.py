@@ -95,16 +95,18 @@ def main():
     for name, conv in convs:
         w = conv.weight.detach().float().cpu().numpy()      # [O,C,kh,kw]
         O, C, kh, kw = w.shape
-        if C % 16 != 0 or kh != 3 or O % 16 != 0:
+        taps = kh * kw
+        # 3x3 走 halo 版内核，1x1（fusion）走流式版内核；两者共用同一套块布局
+        if C % 16 != 0 or kh != kw or kh not in (1, 3) or O % 16 != 0:
             man["layers"][[l["name"] for l in man["layers"]].index(name)]["cm_off"] = -1
             continue
-        wc = np.ascontiguousarray(w.transpose(2, 3, 1, 0).reshape(kh * kw * C, O))  # [tap*C][O]
+        wc = np.ascontiguousarray(w.transpose(2, 3, 1, 0).reshape(taps * C, O))  # [tap*C][O]
         # 张量核友好布局：[tap][16通道块][16输出通道块][k][n]，每个 16x16 块连续
-        wc = wc.reshape(9, C // 16, 16, O // 16, 16).transpose(0, 1, 3, 2, 4)
+        wc = wc.reshape(taps, C // 16, 16, O // 16, 16).transpose(0, 1, 3, 2, 4)
         # 输出通道补齐到 64 的倍数：张量核每个 workgroup 固定算 64 个 oc
         if O % 64:
             ncg = (O + 63) // 64 * 4
-            pad = np.zeros((9, C // 16, ncg, 16, 16), np.float16)
+            pad = np.zeros((taps, C // 16, ncg, 16, 16), np.float16)
             pad[:, :, : O // 16] = wc
             wc = pad
         wc = np.ascontiguousarray(wc)
