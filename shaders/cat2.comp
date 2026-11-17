@@ -1,0 +1,27 @@
+#version 450
+// 逐像素拼接两个通道组：y[p] = [ a[p] (CA 个) , b[p] (CB 个) ]，用于 fusion 前的 cat。
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly buffer A { float a[]; };
+layout(binding = 1) readonly buffer B { float b[]; };
+layout(binding = 3) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform P {
+    int C_;           // CA
+    int H;            // CB
+    int W;            // 像素数
+    int O;            // 未用
+    float slope;
+    int k;
+} p;
+
+void main() {
+    const uint pix = gl_GlobalInvocationID.x;
+    if (int(pix) >= p.W) return;
+    const int ca = p.C_, cb = p.H;
+    const int ab = int(pix) * ca;
+    const int bb = int(pix) * cb;
+    const int yb = int(pix) * (ca + cb);
+    for (int c = 0; c < ca; ++c) y[yb + c] = a[ab + c];
+    for (int c = 0; c < cb; ++c) y[yb + ca + c] = b[bb + c];
+}

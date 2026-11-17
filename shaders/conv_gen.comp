@@ -1,0 +1,52 @@
+#version 450
+// 通用卷积（任意 C、O、k∈{1,3}），NHWC，标量实现。
+// 用于 C≠64 的场合：feat_extract（C=3,O=64）、conv_last（C=32,O=3）、fusion（1x1, C=128,O=64）。
+// 一个线程算一个像素的全部输出通道：先读 C 个数进寄存器，再遍历 O。
+// 这些层只占整模型 FLOPs 的很小一部分，正确性优先。
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly buffer X  { float x[]; };   // [H,W,C]
+layout(binding = 1) readonly buffer Wt { float w[]; };   // [O,k*k,C]
+layout(binding = 2) readonly buffer Bs { float b[]; };   // [O]
+layout(binding = 3) writeonly buffer Y { float y[]; };   // [H,W,O]
+
+layout(push_constant) uniform P {
+    int C_;
+    int H;
+    int W;
+    int O;
+    float slope;      // >0 => LeakyReLU(slope)
+    int k;            // 1 或 3
+} p;
+
+const int CMAX = 128;
+
+void main() {
+    const uint gid = gl_GlobalInvocationID.x;
+    const int npx = p.W * p.H;
+    if (int(gid) >= npx) return;
+    const int ox = int(gid) % p.W;
+    const int oy = int(gid) / p.W;
+
+    const int K = p.k;
+    const int pad = K / 2;
+    const int wrow = K * K * p.C_;
+
+    for (int oc = 0; oc < p.O; ++oc) {
+        float acc = b[oc];
+        const int wb = oc * wrow;
+        for (int ky = 0; ky < K; ++ky) {
+            const int sy = oy + ky - pad;
+            if (sy < 0 || sy >= p.H) continue;
+            for (int kx = 0; kx < K; ++kx) {
+                const int sxs = ox + kx - pad;
+                if (sxs < 0 || sxs >= p.W) continue;
+                const int xb = (sy * p.W + sxs) * p.C_;
+                const int wk = wb + (ky * K + kx) * p.C_;
+                for (int c = 0; c < p.C_; ++c) acc += x[xb + c] * w[wk + c];
+            }
+        }
+        if (p.slope > 0.0 && acc < 0.0) acc *= p.slope;
+        y[gid * uint(p.O) + uint(oc)] = acc;
+    }
+}

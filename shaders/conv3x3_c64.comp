@@ -1,0 +1,132 @@
+#version 450
+// NHWC + shared memory + 寄存器分块 的 3x3 卷积，C=64 任意 O（8 的倍数）。
+//
+// 用途：20 个 forward block、20 个 backward block（O=64）、up1（O=256）、up2（O=128）。
+// 分块：RM=4（每线程 4 个像素行）、RN=8（8 个输出通道），权重读一次被 4 个像素复用。
+// workgroup = 8 列 x 2 个"4 行组" x 8 个 oc 组 = 128 线程，tile = 8x8 像素。
+// O > 64 时线程在 shader 内循环 oc 组（og += 8），共享一份输入 tile。
+layout(local_size_x = 8, local_size_y = 2, local_size_z = 8) in;
+
+const int TILE = 8;
+const int C = 64;
+const int C4 = C / 4;          // 16 个 vec4/像素
+const int SSTRIDE = C4 + 1;    // 填充 1 个 vec4，错开 bank
+const int HALO = TILE + 2;
+const int NTHREADS = 8 * 2 * 8;
+
+layout(binding = 0) readonly buffer X  { vec4 x4[]; };   // [H,W,C/4]
+layout(binding = 1) readonly buffer Wt { vec4 w4[]; };   // [O,9,C/4]
+layout(binding = 2) readonly buffer Bs { float b[]; };   // [O]
+layout(binding = 3) writeonly buffer Y { vec4 y4[]; };   // [H,W,O/4]
+
+layout(push_constant) uniform P {
+    int C_;
+    int H;
+    int W;
+    int O;
+    float slope;      // >0 => LeakyReLU(slope)
+} p;
+
+shared vec4 s4[HALO * HALO * SSTRIDE];
+
+void main() {
+    const ivec3 lid = ivec3(gl_LocalInvocationID);
+    const int lx = lid.x, ly = lid.y, lz = lid.z;
+    const int tid = (lz * 2 + ly) * 8 + lx;
+    const ivec2 base = ivec2(gl_WorkGroupID.xy) * TILE;
+
+    // ---- 协作载入 (TILE+2)^2 x C 到 shared ----
+    const int NPIX = HALO * HALO;
+    for (int i = tid; i < NPIX * C4; i += NTHREADS) {
+        const int c4 = i & (C4 - 1);
+        const int pix = i >> 4;
+        const int py = pix / HALO;
+        const int px = pix - py * HALO;
+        const int gy = base.y + py - 1;
+        const int gx = base.x + px - 1;
+        vec4 v = vec4(0.0);
+        if (gy >= 0 && gy < p.H && gx >= 0 && gx < p.W) {
+            v = x4[(gy * p.W + gx) * C4 + c4];
+        }
+        s4[pix * SSTRIDE + c4] = v;
+    }
+    barrier();
+
+    const int ox = base.x + lx;
+    if (ox >= p.W) return;
+
+    const int row0 = ly * 4;
+    const int oy0 = base.y + row0;
+    const int O4 = p.O >> 2;                   // 输出的 vec4 通道数
+    const int wstep = 9 * C4;
+    const float sl = p.slope;
+
+    for (int og = lz; og * 8 < p.O; og += 8) {
+        const int oc0 = og * 8;
+
+        const float b0 = b[oc0 + 0], b1 = b[oc0 + 1], b2 = b[oc0 + 2], b3 = b[oc0 + 3];
+        const float b4 = b[oc0 + 4], b5 = b[oc0 + 5], b6 = b[oc0 + 6], b7 = b[oc0 + 7];
+        float p0a = b0, p0b = b1, p0c = b2, p0d = b3, p0e = b4, p0f = b5, p0g = b6, p0h = b7;
+        float p1a = b0, p1b = b1, p1c = b2, p1d = b3, p1e = b4, p1f = b5, p1g = b6, p1h = b7;
+        float p2a = b0, p2b = b1, p2c = b2, p2d = b3, p2e = b4, p2f = b5, p2g = b6, p2h = b7;
+        float p3a = b0, p3b = b1, p3c = b2, p3d = b3, p3e = b4, p3f = b5, p3g = b6, p3h = b7;
+
+        const int w0 = (oc0 * 9) * C4;
+
+        for (int ky = 0; ky < 3; ++ky) {
+            const int sb = ((row0 + ky) * HALO + lx) * SSTRIDE;
+            const int s0 = sb;
+            const int s1 = sb + HALO * SSTRIDE;
+            const int s2 = s1 + HALO * SSTRIDE;
+            const int s3 = s2 + HALO * SSTRIDE;
+            for (int kx = 0; kx < 3; ++kx) {
+                const int wb = w0 + (ky * 3 + kx) * C4;
+                for (int c4 = 0; c4 < C4; ++c4) {
+                    const vec4 v0 = s4[s0 + kx * SSTRIDE + c4];
+                    const vec4 v1 = s4[s1 + kx * SSTRIDE + c4];
+                    const vec4 v2 = s4[s2 + kx * SSTRIDE + c4];
+                    const vec4 v3 = s4[s3 + kx * SSTRIDE + c4];
+                    const vec4 k0 = w4[wb + 0 * wstep + c4];
+                    const vec4 k1 = w4[wb + 1 * wstep + c4];
+                    const vec4 k2 = w4[wb + 2 * wstep + c4];
+                    const vec4 k3 = w4[wb + 3 * wstep + c4];
+                    const vec4 k4 = w4[wb + 4 * wstep + c4];
+                    const vec4 k5 = w4[wb + 5 * wstep + c4];
+                    const vec4 k6 = w4[wb + 6 * wstep + c4];
+                    const vec4 k7 = w4[wb + 7 * wstep + c4];
+                    p0a += dot(v0, k0); p0b += dot(v0, k1); p0c += dot(v0, k2); p0d += dot(v0, k3);
+                    p0e += dot(v0, k4); p0f += dot(v0, k5); p0g += dot(v0, k6); p0h += dot(v0, k7);
+                    p1a += dot(v1, k0); p1b += dot(v1, k1); p1c += dot(v1, k2); p1d += dot(v1, k3);
+                    p1e += dot(v1, k4); p1f += dot(v1, k5); p1g += dot(v1, k6); p1h += dot(v1, k7);
+                    p2a += dot(v2, k0); p2b += dot(v2, k1); p2c += dot(v2, k2); p2d += dot(v2, k3);
+                    p2e += dot(v2, k4); p2f += dot(v2, k5); p2g += dot(v2, k6); p2h += dot(v2, k7);
+                    p3a += dot(v3, k0); p3b += dot(v3, k1); p3c += dot(v3, k2); p3d += dot(v3, k3);
+                    p3e += dot(v3, k4); p3f += dot(v3, k5); p3g += dot(v3, k6); p3h += dot(v3, k7);
+                }
+            }
+        }
+
+        const int yc = oc0 >> 2;
+        const int ybase = oy0 * p.W * O4 + ox * O4 + yc;
+#define STORE(rowacc, r)                                                        \
+        {                                                                       \
+            const int yb = ybase + (r) * p.W * O4;                              \
+            y4[yb + 0] = vec4(                                                  \
+                sl > 0.0 && rowacc##a < 0.0 ? rowacc##a * sl : rowacc##a,        \
+                sl > 0.0 && rowacc##b < 0.0 ? rowacc##b * sl : rowacc##b,        \
+                sl > 0.0 && rowacc##c < 0.0 ? rowacc##c * sl : rowacc##c,        \
+                sl > 0.0 && rowacc##d < 0.0 ? rowacc##d * sl : rowacc##d);       \
+            y4[yb + 1] = vec4(                                                  \
+                sl > 0.0 && rowacc##e < 0.0 ? rowacc##e * sl : rowacc##e,        \
+                sl > 0.0 && rowacc##f < 0.0 ? rowacc##f * sl : rowacc##f,        \
+                sl > 0.0 && rowacc##g < 0.0 ? rowacc##g * sl : rowacc##g,        \
+                sl > 0.0 && rowacc##h < 0.0 ? rowacc##h * sl : rowacc##h);       \
+        }
+
+        if (oy0 + 0 < p.H) STORE(p0, 0)
+        if (oy0 + 1 < p.H) STORE(p1, 1)
+        if (oy0 + 2 < p.H) STORE(p2, 2)
+        if (oy0 + 3 < p.H) STORE(p3, 3)
+#undef STORE
+    }
+}

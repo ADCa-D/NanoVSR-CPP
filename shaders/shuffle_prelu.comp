@@ -1,0 +1,80 @@
+#version 450
+#ifdef IN_F16
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#endif
+// PixelShuffle(2) + PReLU，NHWC，用 shared 中转把写变成连续。
+//   输入 x[ H ][ W ][4C]  ->  输出 y[ 2H ][ 2W ][ C ]
+//   y[(2h+i)][(2w+j)][c] = prelu( x[h][w][4c + 2i + j] )
+//
+// 分工：workgroup 处理输入的一行里 16 个像素（16*4C 个数），先合并读进 shared，
+// 再按输出像素连续写出（每线程一个输出像素，写 C 个 float）。
+layout(local_size_x = 64) in;
+
+const int TILEX = 16;
+
+#ifdef IN_F16
+layout(binding = 0) readonly buffer X { float16_t x[]; };
+#else
+layout(binding = 0) readonly buffer X { float x[]; };
+#endif
+layout(binding = 3) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform P {
+    int C_;
+    int H;
+    int W;
+    int O;            // 未用
+    float prelu;
+    int k;            // 未用
+} p;
+
+shared float s[TILEX * 4 * 64];      // 最大 C=64 -> 16*256
+
+void main() {
+    const int C = p.C_;
+    const int bx = int(gl_WorkGroupID.x) * TILEX;
+    const int by = int(gl_WorkGroupID.y);
+    if (by >= p.H) return;
+    const int n = TILEX * 4 * C;
+    const int OW = p.W * 2;
+
+    // 1) 合并读入 shared
+    for (int i = int(gl_LocalInvocationID.x); i < n; i += 64) {
+        const int px_local = i / (4 * C);
+        const int rest = i - px_local * (4 * C);
+        const int gx = bx + px_local;
+        float v = 0.0;
+#ifdef IN_F16
+        if (gx < p.W) v = float(x[((by * p.W) + gx) * 4 * C + rest]);
+#else
+        if (gx < p.W) v = x[((by * p.W) + gx) * 4 * C + rest];
+#endif
+        s[i] = v;
+    }
+    barrier();
+
+    // 2) 每个线程写一个输出像素（连续 C 个数）
+    const int nout = TILEX * 4;                 // 2 行 x 2*TILEX 列
+    if (int(gl_LocalInvocationID.x) >= nout) return;
+    const int row = int(gl_LocalInvocationID.x) / (TILEX * 2);      // 0/1
+    const int col = int(gl_LocalInvocationID.x) - row * TILEX * 2;  // 0..2*TILEX-1
+    const int wl = col >> 1;
+    const int j = col & 1;
+    const int i_ = row;
+    const int h = by;
+    const int w = bx + wl;
+    if (w >= p.W) return;
+    const int sb = wl * 4 * C + i_ * 2 + j;     // 该输出像素在 shared 里的通道起点
+    const int yb = ((h * 2 + i_) * OW + (w * 2 + j)) * C;
+    const float sl = p.prelu;
+    for (int c = 0; c < C; ++c) {
+#ifdef IN_F16
+        float v = float(s[sb + c * 4]);
+#else
+        float v = s[sb + c * 4];
+#endif
+        if (v < 0.0) v *= sl;
+        y[yb + c] = v;
+    }
+}

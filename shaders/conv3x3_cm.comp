@@ -1,0 +1,130 @@
+#version 450
+// 张量核版 3x3 卷积（C=64, O=64，NHWC）。
+//
+// 分工（第三版：按输出通道切 warp，把权重流量压到 1/4）：
+//   workgroup = 8 warp（256 线程），tile = 32x4 = 128 个像素。
+//   warp w -> oc 组 = w % 4（16 个输出通道），像素块 = w / 4（每块 2 行 x 2 个半行）
+//   每个 warp 在自己的 64 个像素上算 16 个输出通道，B 片段只加载 36 次（而不是 144 次）。
+//
+// 输入输出整体仍是 f32，只在载入 shared tile 时转 f16。
+// glslang 的 KHR 签名是「数组 + 元素偏移」：coopMatLoad(out m, buf[], elemOff, stride, layout)
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+layout(local_size_x = 256) in;
+
+const int TW = 32;        // tile 宽（像素）
+const int TH = 4;         // tile 高
+#ifndef C_OVERRIDE
+#define C_OVERRIDE 64
+#endif
+const int C = C_OVERRIDE;    // 输入通道（按模型 num_feat 编译变体）
+const int SW = TW + 2;    // 34（含 halo）
+const int SH = TH + 2;    // 6
+
+layout(binding = 0) readonly buffer X  { float x[]; };        // [H,W,C] f32
+layout(binding = 1) readonly buffer Wt { float16_t w[]; };    // [tap][C][O] f16
+layout(binding = 2) readonly buffer Bs { float b[]; };        // [O]
+#ifdef OUT_F16
+layout(binding = 3) writeonly buffer Y { float16_t y[]; };   // [H,W,O] f16（省一半带宽/显存）
+#else
+layout(binding = 3) writeonly buffer Y { float y[]; };       // [H,W,O] f32
+#endif
+
+layout(push_constant) uniform P {
+    int C_;
+    int H;
+    int W;
+    int ON;
+    float slope;
+    int k;
+} p;
+
+shared float16_t s_in[SH * SW * C];
+shared float s_out[8 * 256];
+
+const int RM = gl_CooperativeMatrixLayoutRowMajor;
+
+void main() {
+    const int tid = int(gl_LocalInvocationID.x);
+    const int warp = tid / 32;
+    const int lane = tid % 32;
+    const ivec2 base = ivec2(gl_WorkGroupID.xy) * ivec2(TW, TH);
+
+    // ---- 1) 载入 halo tile（f32 -> f16），零填充 ----
+    for (int i = tid; i < SH * SW * C; i += 256) {
+        const int c = i % C;
+        const int pix = i / C;
+        const int py = pix / SW;
+        const int px = pix - py * SW;
+        const int gy = base.y + py - 1;
+        const int gx = base.x + px - 1;
+        float v = 0.0;
+        if (gy >= 0 && gy < p.H && gx >= 0 && gx < p.W) v = x[(gy * p.W + gx) * C + c];
+        s_in[pix * C + c] = float16_t(v);
+    }
+    barrier();
+
+    const int ocbase = int(gl_WorkGroupID.z) * 64;   // O>64 时用 z 维分段
+    const int og = warp & 3;             // 0..3 -> 输出通道块
+    const int pb = warp >> 2;            // 0..1 -> 像素块（2 行）
+    const int oc0 = ocbase + og * 16;
+    const int row0 = pb * 2;             // tile 内起始行
+
+    coopmat<float, 16, 16, 16, gl_MatrixUseAccumulator> a0 =
+        coopmat<float, 16, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    coopmat<float, 16, 16, 16, gl_MatrixUseAccumulator> a1 = a0;
+    coopmat<float, 16, 16, 16, gl_MatrixUseAccumulator> a2 = a0;
+    coopmat<float, 16, 16, 16, gl_MatrixUseAccumulator> a3 = a0;
+
+    for (int tap = 0; tap < 9; ++tap) {
+        const int ky = tap / 3, kx = tap % 3;
+        for (int cc = 0; cc < C / 16; ++cc) {
+            coopmat<float16_t, 16, 16, 16, gl_MatrixUseB> fb;
+            coopMatLoad(fb, w, (((tap * (C / 16) + cc) * (p.ON >> 4)) + (oc0 >> 4)) * 256, 16, RM);
+            const int r0 = ((row0 + 0 + ky) * SW + (0 + kx)) * C + cc * 16;
+            const int r1 = ((row0 + 0 + ky) * SW + (16 + kx)) * C + cc * 16;
+            const int r2 = ((row0 + 1 + ky) * SW + (0 + kx)) * C + cc * 16;
+            const int r3 = ((row0 + 1 + ky) * SW + (16 + kx)) * C + cc * 16;
+            coopmat<float16_t, 16, 16, 16, gl_MatrixUseA> fa0, fa1, fa2, fa3;
+            coopMatLoad(fa0, s_in, r0, C, RM);
+            coopMatLoad(fa1, s_in, r1, C, RM);
+            coopMatLoad(fa2, s_in, r2, C, RM);
+            coopMatLoad(fa3, s_in, r3, C, RM);
+            a0 = coopMatMulAdd(fa0, fb, a0);
+            a1 = coopMatMulAdd(fa1, fb, a1);
+            a2 = coopMatMulAdd(fa2, fb, a2);
+            a3 = coopMatMulAdd(fa3, fb, a3);
+        }
+    }
+
+    // ---- 2) 4 个片段依次落盘（bias + LeakyReLU）----
+    for (int g = 0; g < 4; ++g) {
+        if (g == 0) coopMatStore(a0, s_out, warp * 256, 16, RM);
+        if (g == 1) coopMatStore(a1, s_out, warp * 256, 16, RM);
+        if (g == 2) coopMatStore(a2, s_out, warp * 256, 16, RM);
+        if (g == 3) coopMatStore(a3, s_out, warp * 256, 16, RM);
+        barrier();
+        const int row = row0 + (g >> 1);
+        const int px0 = (g & 1) * 16;
+        const int oy = base.y + row;
+        for (int i = lane; i < 256; i += 32) {
+            const int pl = i / 16;
+            const int oc = i - pl * 16;
+            const int gx = base.x + px0 + pl;
+            const int ch = oc0 + oc;
+            if (gx < p.W && oy < p.H) {
+                float v = s_out[warp * 256 + i] + b[ch];
+                if (p.slope > 0.0 && v < 0.0) v *= p.slope;
+                #ifdef OUT_F16
+                y[(oy * p.W + gx) * p.ON + ch] = float16_t(v);
+#else
+                y[(oy * p.W + gx) * p.ON + ch] = v;
+#endif
+            }
+        }
+        barrier();
+    }
+}

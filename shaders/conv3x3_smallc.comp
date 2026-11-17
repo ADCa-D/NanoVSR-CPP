@@ -1,0 +1,71 @@
+#version 450
+// 小通道数 3x3 卷积（C <= 32，O 任意），NHWC。
+//   feat_extract（C=3  -> O=64）
+//   conv_last   （C=32 -> O=3，在 4x 分辨率上跑）
+//
+// 分工：workgroup = 8x8 输出像素，输入 tile（含 halo）放 shared；
+// 每线程对自己这个像素遍历全部输出通道，权重走 warp 广播（oc 循环是 uniform 的）。
+// shared 用固定 stride 33（C<=32 + 1 填充），避免 bank 冲突。
+layout(local_size_x = 8, local_size_y = 8) in;
+
+const int TILE = 8;
+const int HALO = TILE + 2;
+const int SSTRIDE = 33;         // >= C+1
+
+layout(binding = 0) readonly buffer X  { float x[]; };   // [H,W,C]
+layout(binding = 1) readonly buffer Wt { float w[]; };   // [O,9,C]
+layout(binding = 2) readonly buffer Bs { float b[]; };   // [O]
+layout(binding = 3) writeonly buffer Y { float y[]; };   // [H,W,O]
+
+layout(push_constant) uniform P {
+    int C_;
+    int H;
+    int W;
+    int O;
+    float slope;
+    int k;
+} p;
+
+shared float s[HALO * HALO * SSTRIDE];
+
+void main() {
+    const int lx = int(gl_LocalInvocationID.x);
+    const int ly = int(gl_LocalInvocationID.y);
+    const int tid = ly * TILE + lx;
+    const int nthreads = TILE * TILE;
+    const ivec2 base = ivec2(gl_WorkGroupID.xy) * TILE;
+    const int C = p.C_;
+
+    // 协作载入 (TILE+2)^2 x C
+    for (int i = tid; i < HALO * HALO * C; i += nthreads) {
+        const int c = i % C;
+        const int pix = i / C;
+        const int py = pix / HALO;
+        const int px = pix - py * HALO;
+        const int gy = base.y + py - 1;
+        const int gx = base.x + px - 1;
+        float v = 0.0;
+        if (gy >= 0 && gy < p.H && gx >= 0 && gx < p.W) v = x[(gy * p.W + gx) * C + c];
+        s[pix * SSTRIDE + c] = v;
+    }
+    barrier();
+
+    const int ox = base.x + lx;
+    const int oy = base.y + ly;
+    if (ox >= p.W || oy >= p.H) return;
+
+    const float sl = p.slope;
+    for (int oc = 0; oc < p.O; ++oc) {
+        float acc = b[oc];
+        const int wb = oc * 9 * C;
+        for (int ky = 0; ky < 3; ++ky) {
+            for (int kx = 0; kx < 3; ++kx) {
+                const int sb = ((ly + ky) * HALO + (lx + kx)) * SSTRIDE;
+                const int wk = wb + (ky * 3 + kx) * C;
+                for (int c = 0; c < C; ++c) acc += s[sb + c] * w[wk + c];
+            }
+        }
+        if (sl > 0.0 && acc < 0.0) acc *= sl;
+        y[(oy * p.W + ox) * p.O + oc] = acc;
+    }
+}

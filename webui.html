@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>NanoVSR 4x 超分</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.6 system-ui, "Segoe UI", sans-serif;
+         background: #14161a; color: #e6e8eb; }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 28px 20px 60px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: #8b929c; font-size: 13px; margin-bottom: 22px; }
+  .card { background: #1b1e24; border: 1px solid #262a32; border-radius: 10px;
+          padding: 18px; margin-bottom: 16px; }
+  #drop { border: 2px dashed #333a45; border-radius: 10px; padding: 34px 16px;
+          text-align: center; color: #8b929c; cursor: pointer; transition: .15s; }
+  #drop.hot { border-color: #4b8bf5; background: #1a2333; color: #cbd6e8; }
+  #drop b { color: #e6e8eb; }
+  .row { display: flex; gap: 14px; flex-wrap: wrap; align-items: flex-end; margin-top: 14px; }
+  label { font-size: 12px; color: #8b929c; display: block; margin-bottom: 4px; }
+  input[type=number], select { background: #12141a; color: #e6e8eb; border: 1px solid #2b313b;
+         border-radius: 7px; padding: 7px 9px; width: 110px; }
+  button { background: #2f6fed; color: #fff; border: 0; border-radius: 8px;
+           padding: 9px 18px; font-size: 14px; cursor: pointer; }
+  button:disabled { background: #2a303a; color: #6b7280; cursor: default; }
+  #bar { height: 8px; background: #23272f; border-radius: 99px; overflow: hidden; margin-top: 14px; }
+  #bar > div { height: 100%; width: 0; background: linear-gradient(90deg,#2f6fed,#5ea0ff);
+               transition: width .2s; }
+  .meta { display: flex; justify-content: space-between; color: #8b929c; font-size: 12px;
+          margin-top: 6px; }
+  pre { background: #12141a; border: 1px solid #23272f; border-radius: 8px; padding: 10px;
+        max-height: 190px; overflow: auto; font-size: 12px; color: #9aa4b2; margin: 0; }
+  video { width: 100%; border-radius: 8px; background: #000; margin-top: 12px; }
+  a.dl { display: inline-block; margin-top: 12px; color: #7db2ff; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>NanoVSR · 4× 视频超分</h1>
+  <div class="sub">C++ + Vulkan compute 推理，不依赖 PyTorch / CUDA。双向循环 + 张量核 + 自动空间分块。</div>
+
+  <div class="card">
+    <div id="drop">把视频拖到这里，或<b>点击选择文件</b><br>
+      <span style="font-size:12px">mp4 / mkv / mov / webm，输出固定为输入的 4 倍分辨率</span>
+    </div>
+    <input type="file" id="file" accept="video/*" class="hidden">
+
+    <div class="row">
+      <div><label>档位</label>
+        <select id="preset">
+          <option value="preview">预览 · 最快（短时间窗 + 大 tile + CRF22）</option>
+          <option value="balanced" selected>均衡 · 默认（30 帧窗 + CRF18）</option>
+          <option value="quality">画质 · 慢（30 帧窗 + CRF14）</option>
+        </select></div>
+      <div><label>模型</label>
+        <select id="model">
+          <option value="644k">644k · 最快（0.7M 参数）</option>
+          <option value="1.7m" selected>1.7m · 默认（1.9M 参数）</option>
+          <option value="5.4m">5.4m · 最慢最细（6.1M 参数）</option>
+        </select></div>
+      <div><label>限制帧数（0 = 全部，用来快速试片）</label>
+        <input type="number" id="limit" value="0" min="0"></div>
+      <button id="go" disabled>开始超分</button>
+    </div>
+    <div class="sub" id="preset-desc" style="margin-top:10px">
+      均衡：chunk 30（对齐训练长序列），tile 按显存自动选，CRF 18。
+    </div>
+  </div>
+
+  <div class="card hidden" id="progress-card">
+    <div style="display:flex;justify-content:space-between">
+      <span id="state">处理中…</span><span id="fps" style="color:#8b929c"></span>
+    </div>
+    <div id="bar"><div></div></div>
+    <div class="meta"><span id="frames">0 帧</span><span id="eta"></span></div>
+    <pre id="log" style="margin-top:12px"></pre>
+  </div>
+
+  <div class="card hidden" id="result">
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <b>完成</b><a class="dl" id="dl" href="#">下载结果 ↓</a>
+    </div>
+    <video id="vid" controls></video>
+  </div>
+</div>
+
+<script>
+let file = null, jobId = null, timer = null;
+
+const $ = id => document.getElementById(id);
+const drop = $('drop'), inp = $('file');
+
+drop.onclick = () => inp.click();
+drop.ondragover = e => { e.preventDefault(); drop.classList.add('hot'); };
+drop.ondragleave = () => drop.classList.remove('hot');
+drop.ondrop = e => {
+  e.preventDefault(); drop.classList.remove('hot');
+  if (e.dataTransfer.files.length) setFile(e.dataTransfer.files[0]);
+};
+inp.onchange = () => { if (inp.files.length) setFile(inp.files[0]); };
+
+function setFile(f) {
+  file = f;
+  drop.innerHTML = `<b>${f.name}</b><br><span style="font-size:12px">${(f.size/1e6).toFixed(1)} MB</span>`;
+  $('go').disabled = false;
+}
+
+$('go').onclick = async () => {
+  if (!file) return;
+  $('go').disabled = true;
+  $('progress-card').classList.remove('hidden');
+  $('result').classList.add('hidden');
+  $('bar').firstElementChild.style.width = '0';
+  $('state').textContent = '上传中…';
+  const q = new URLSearchParams({
+    name: file.name,
+    preset: $('preset').value,
+    model: $('model').value,
+    limit: $('limit').value || '0',
+  });
+  const r = await fetch('/api/run?' + q, { method: 'POST', body: file });
+  const j = await r.json();
+  jobId = j.id;
+  timer = setInterval(poll, 600);
+};
+
+async function poll() {
+  const r = await fetch('/api/status?id=' + jobId);
+  if (!r.ok) return;
+  const j = await r.json();
+  const total = j.total || 0, done = j.frames || 0;
+  const pct = total ? Math.min(100, done * 100 / total) : (j.state === 'done' ? 100 : 5);
+  $('bar').firstElementChild.style.width = pct + '%';
+  $('frames').textContent = total ? `${done} / ${total} 帧` : `${done} 帧`;
+  $('log').textContent = (j.log || '').trim();
+  if (j.elapsed && done) $('fps').textContent = (done / j.elapsed).toFixed(2) + ' fps';
+  const src = j.w ? `${j.w}×${j.h}` : '';
+  $('state').textContent = j.state === 'done' ? '完成' : j.state === 'error' ? '出错' : `处理中…（${j.chunk || '自动'} 帧/块，源 ${src}）`;
+  if (j.state === 'done') {
+    clearInterval(timer);
+    $('result').classList.remove('hidden');
+    $('dl').href = '/api/out/' + jobId;
+    $('vid').src = '/api/out/' + jobId;
+    $('go').disabled = false;
+  } else if (j.state === 'error') {
+    clearInterval(timer);
+    $('state').textContent = '出错';
+    $('log').textContent = j.err || j.log || '';
+    $('go').disabled = false;
+  }
+}
+</script>
+</body>
+</html>
+<script>
+const DESC = {
+  preview: "预览：chunk 8（时间窗短、重建边界多），显存省下来给更大的 tile，CRF 22。适合先看效果。",
+  balanced: "均衡：chunk 30（对齐训练长序列），tile 按显存自动选，CRF 18。",
+  quality: "画质：chunk 30 + CRF 14（编码更保真），速度与均衡相同，文件更大。",
+};
+const sel = document.getElementById('preset');
+sel.addEventListener('change', () => { document.getElementById('preset-desc').textContent = DESC[sel.value]; });
+</script>

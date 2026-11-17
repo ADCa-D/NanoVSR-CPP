@@ -1,0 +1,62 @@
+#version 450
+// 4x 双线性插值（align_corners=False）+ 残差 + clamp + 转 8bit。
+//   base = bilinear4x( x[H][W][3] )     -> [4H][4W][3]
+//   out  = clamp( base + y[4H][4W][3], 0, 1 ) * 255 -> uint8
+// 一个线程算一个输出像素的 3 个通道。
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly buffer X { float x[]; };       // [H,W,3] 原图
+layout(binding = 1) readonly buffer R { float r[]; };       // [4H,4W,3] conv_last 输出
+layout(binding = 3) writeonly buffer Y { uint y8[]; };      // 打包 RGB（r | g<<8 | b<<16）
+
+layout(push_constant) uniform P {
+    int C_;           // 未用
+    int H;            // 原图高
+    int W;            // 原图宽
+    int O;            // 尺度 4
+    float slope;      // 未用
+    int k;            // 未用
+} p;
+
+// PyTorch: src = (dst + 0.5) * (1/scale) - 0.5, 负值截到 0；in0 = floor(src)，in1 = min(in0+1, size-1)
+float src_coord(int dst, int size) {
+    float s = (float(dst) + 0.5) * (1.0 / 4.0) - 0.5;
+    return s < 0.0 ? 0.0 : s;
+}
+
+void main() {
+    const uint gid = gl_GlobalInvocationID.x;
+    const int OW = p.W * 4;
+    const int OH = p.H * 4;
+    if (int(gid) >= OW * OH) return;
+    const int ox = int(gid) % OW;
+    const int oy = int(gid) / OW;
+
+    const float sx = src_coord(ox, p.W);
+    const float sy = src_coord(oy, p.H);
+    const int x0 = int(floor(sx));
+    const int y0 = int(floor(sy));
+    const int x1 = min(x0 + 1, p.W - 1);
+    const int y1 = min(y0 + 1, p.H - 1);
+    const float fx = sx - float(x0);
+    const float fy = sy - float(y0);
+
+    const int i00 = (y0 * p.W + x0) * 3;
+    const int i01 = (y0 * p.W + x1) * 3;
+    const int i10 = (y1 * p.W + x0) * 3;
+    const int i11 = (y1 * p.W + x1) * 3;
+
+    const int ob = int(gid) * 3;
+    uint packed = 0u;
+    for (int c = 0; c < 3; ++c) {
+        const float v00 = x[i00 + c], v01 = x[i01 + c];
+        const float v10 = x[i10 + c], v11 = x[i11 + c];
+        const float top = mix(v00, v01, fx);
+        const float bot = mix(v10, v11, fx);
+        float v = mix(top, bot, fy) + r[ob + c];
+        v = clamp(v, 0.0, 1.0);
+        const uint u = uint(v * 255.0 + 0.5);
+        packed |= (u & 255u) << uint(c * 8);
+    }
+    y8[gid] = packed;
+}

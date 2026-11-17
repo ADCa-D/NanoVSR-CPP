@@ -1,0 +1,25 @@
+#version 450
+// 8bit 打包 RGB（r | g<<8 | b<<16）-> f32 NHWC [H,W,3]，归一化到 0..1。
+// 解码后的原始帧走这里上显存；反过来最终结果由 bilinear4_add_u8 直接写成打包 u8。
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly buffer IN { uint src[]; };
+layout(binding = 3) writeonly buffer OUT { float dst[]; };
+
+layout(push_constant) uniform P {
+    int C_;
+    int H;        // 像素数
+    int W;
+    int O;
+    float slope;
+    int k;
+} p;
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (int(i) >= p.H) return;
+    const uint v = src[i];
+    dst[i * 3 + 0] = float(v & 255u) / 255.0;
+    dst[i * 3 + 1] = float((v >> 8) & 255u) / 255.0;
+    dst[i * 3 + 2] = float((v >> 16) & 255u) / 255.0;
+}
