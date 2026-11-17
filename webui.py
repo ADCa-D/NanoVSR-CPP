@@ -190,7 +190,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=7861)
     ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--ffmpeg", default=r"D:\ffmpeg-9.0.1\ffmpeg.exe")
+    ap.add_argument("--ffmpeg", default=os.environ.get("FFMPEG") or (r"D:\ffmpeg-9.0.1\ffmpeg.exe" if os.path.exists(r"D:\ffmpeg-9.0.1\ffmpeg.exe") else "ffmpeg"))
     ARGS = ap.parse_args()
     os.makedirs(os.path.join(HERE, "work"), exist_ok=True)
     srv = ThreadingHTTPServer((ARGS.host, ARGS.port), Handler)

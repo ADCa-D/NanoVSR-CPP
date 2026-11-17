@@ -391,8 +391,16 @@ static std::string run_capture(const std::string& cmd) {
 
 int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
-    std::string in_path, out_path, ffmpeg = "D:\\ffmpeg-9.0.1\\ffmpeg.exe";
-    std::string ffprobe = "D:\\ffmpeg-9.0.1\\ffprobe.exe";
+    // 不硬编码路径：环境变量 > 本机已知路径（存在才用）> PATH
+    auto pick_exe = [](const char* env, const char* local, const char* plain) {
+        if (const char* e = std::getenv(env); e && *e) return std::string(e);
+        std::ifstream probe(local);
+        if (probe.good()) return std::string(local);
+        return std::string(plain);
+    };
+    std::string in_path, out_path;
+    std::string ffmpeg = pick_exe("FFMPEG", "D:\\ffmpeg-9.0.1\\ffmpeg.exe", "ffmpeg");
+    std::string ffprobe = pick_exe("FFPROBE", "D:\\ffmpeg-9.0.1\\ffprobe.exe", "ffprobe");
     std::string model_dir = "models_rt/nanovsr_1.7m";
     int chunk_arg = 0, crf = -1, limit = 0, tile_arg_w = 0, tile_arg_h = 0;
     double budget_arg_gb = 0.0;

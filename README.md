@@ -96,4 +96,4 @@ python webui.py --port 7861
 
 ## 许可
 
-代码 MIT。模型权重与架构来自 NanoVSR，遵循其原始许可。
+本仓库代码为 MIT。模型架构与权重来自 [NanoVSR](https://github.com/)，同为 **MIT License**（© 原作者）。

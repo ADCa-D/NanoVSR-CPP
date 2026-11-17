@@ -75,4 +75,4 @@ start_webui.bat          :: 自动打开 http://127.0.0.1:7861
 
 ## 许可
 
-代码 MIT。模型权重与架构来自 NanoVSR，遵循其原始许可。
+本仓库代码为 MIT。模型架构与权重来自 NanoVSR，同为 **MIT License**（© NanoVSR authors），因此可直接使用与再分发，保留版权声明即可。
