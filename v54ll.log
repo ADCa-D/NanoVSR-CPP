@@ -1,0 +1,24 @@
+nanovsr build Nov 17 2026 13:15:28
+输入: kn_in.mp4  854x480  30.000 fps
+输出分辨率: 3416x1920
+模型: num_feat=96, blocks=30
+GPU: NVIDIA GeForce RTX 5060 Laptop GPU
+preset: balanced  (chunk 30, budget 驱动建议 x0.8, crf 0)
+显存账本：预算 5.98 GB（驱动建议 x0.8）
+  权重                36.0 MB  (固定)
+  静态 tile 缓冲    1109.5 MB  (10.7 KB/px x 101 k px)
+  时间维缓冲        3953.7 MB  (1.27 KB/px/帧 x 30 帧)
+  ── 合计             5.10 GB / 5.98 GB  (余 883 MB)
+→ tile 352x288（overlap 96），分块 6 块，单块最大 101 k 像素
+  总处理量 0.61 M 像素/帧（帧本身 0.41 M，放大 1.48x）
+张量核 shader: shaders/conv3x3_cm_96.spv
+编码器: -c:v libx264 -crf 0 -preset veryfast
+处理 6 帧  1.31 fps  [tile 6/6]
+完成: 6 帧
+[vost#0:0/rawvideo @ 00000217da96e040] Error submitting a packet to the muxer: Broken pipe
+    Last message repeated 1 times
+[out#0/rawvideo @ 00000217d871fb40] Error muxing a packet
+[out#0/rawvideo @ 00000217d871fb40] Task finished with error code: -32 (Broken pipe)
+[out#0/rawvideo @ 00000217d871fb40] Terminating thread with return code -32 (Broken pipe)
+[out#0/rawvideo @ 00000217d871fb40] Error writing trailer: Broken pipe
+[out#0/rawvideo @ 00000217d871fb40] Error closing file: Broken pipe

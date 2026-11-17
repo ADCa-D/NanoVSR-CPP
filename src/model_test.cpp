@@ -325,19 +325,24 @@ struct WLayer {
 
 static double compare(const char* tag, const float* got, const float* ref, size_t n,
                       double tol) {
-    double md = 0.0, sum = 0.0;
+    double md = 0.0, sum = 0.0, amax = 0.0;
     size_t worst = 0;
     for (size_t i = 0; i < n; ++i) {
         double d = std::fabs((double)got[i] - (double)ref[i]);
+        double a = std::fabs((double)ref[i]);
+        if (a > amax) amax = a;
         sum += d;
         if (d > md) {
             md = d;
             worst = i;
         }
     }
-    std::printf("  %-14s maxdiff %.3e  meandiff %.3e  %s\n", tag, md, sum / (double)n,
-                md < tol ? "OK" : "**FAIL**");
-    if (md >= tol) {
+    // fp16 张量核 vs fp32 参考：绝对 2e-2 或 相对 5e-3（对幅值）任一满足即通过
+    const double rel = md / (amax > 1e-6 ? amax : 1.0);
+    const bool ok = (md < tol) || (rel < 5e-3);
+    std::printf("  %-14s maxdiff %.3e  meandiff %.3e  rel %.2e  %s\n", tag, md, sum / (double)n,
+                rel, ok ? "OK" : "**FAIL**");
+    if (!ok) {
         std::printf("      最差位置 %zu: got %.6f ref %.6f\n", worst, got[worst], ref[worst]);
     }
     return md;
@@ -363,6 +368,8 @@ int main(int argc, char** argv) {
         Hh = jint("H", p);
         Ww = jint("W", p);
     }
+    const int jF = jint("num_feat");          // 64 / 48 / 96
+    int jnb = jint("num_blocks");             // 20 / 12 / 30（老清单可能没有）
     std::vector<WLayer> layers;
     {
         size_t p = 0;
@@ -393,8 +400,8 @@ int main(int argc, char** argv) {
             p = pe;
         }
     }
-    std::printf("清单: T=%d H=%d W=%d  层数 %zu\n", T, Hh, Ww, layers.size());
-    if (layers.size() < 45) {
+    std::printf("num_feat=%d blocks=%d  T=%d H=%d W=%d  n=%zu\n", jF, jnb, T, Hh, Ww, layers.size());
+    if ((int)layers.size() < 2 * jnb + 5) {
         std::printf("清单解析异常（层数偏少）\n");
         return 1;
     }
@@ -409,6 +416,10 @@ int main(int argc, char** argv) {
             idx[js.substr(q1 + 1, q2 - q1 - 1)] = i++;
             p = q2;
         }
+    }
+    if (jnb <= 0) {                       // 老版清单没有 num_blocks，按层名兜底
+        for (const auto& kv : idx)
+            if (kv.first.rfind("forward_", 0) == 0) ++jnb;
     }
     float prelu1 = 0.0263f, prelu2 = 0.0393f;
     {
@@ -433,7 +444,10 @@ int main(int argc, char** argv) {
     Buf bwcm = g.alloc(cmblob.size());
     std::memcpy(bwcm.mapped, cmblob.data(), cmblob.size());
 
-    const size_t F = 64;                       // num_feat
+    const size_t F = (size_t)jF;
+    const int up1O = layers[idx["up1"]].O;        // 4F
+    const int up2O = layers[idx["up2"]].O;        // 128
+    const int clC = layers[idx["conv_last"]].C;   // 32
     const size_t px = (size_t)Hh * Ww;
     Buf bx = g.alloc((VkDeviceSize)T * px * 3 * 4);
     Buf bfeat = g.alloc((VkDeviceSize)T * px * F * 4);
@@ -444,10 +458,10 @@ int main(int argc, char** argv) {
     Buf bcatus = g.alloc((VkDeviceSize)px * F * 4);
     Buf bcat = g.alloc((VkDeviceSize)px * 2 * F * 4);
     Buf bfused = g.alloc((VkDeviceSize)px * F * 4);
-    Buf bconv1 = g.alloc((VkDeviceSize)px * 4 * 256 * 4);
+    Buf bconv1 = g.alloc((VkDeviceSize)px * 4 * (size_t)up1O * 4);
     Buf bup1 = g.alloc((VkDeviceSize)px * 4 * F * 4);
-    Buf bconv2 = g.alloc((VkDeviceSize)px * 16 * 128 * 4);
-    Buf bup2 = g.alloc((VkDeviceSize)px * 16 * 32 * 4);
+    Buf bconv2 = g.alloc((VkDeviceSize)px * 16 * (size_t)up2O * 4);
+    Buf bup2 = g.alloc((VkDeviceSize)px * 16 * (size_t)clC * 4);
     Buf blast = g.alloc((VkDeviceSize)px * 16 * 3 * 4);
     Buf bout = g.alloc((VkDeviceSize)T * px * 16 * 4);
     Buf btmp = g.alloc((VkDeviceSize)T * px * 16 * 4);   // 8bit 结果暂存（uint 打包）
@@ -460,7 +474,11 @@ int main(int argc, char** argv) {
     const VkPipeline pConv64 = g.pipe("shaders/conv3x3_c64.spv");
     const VkPipeline pConvGen = g.pipe("shaders/conv_gen.spv");
     const VkPipeline pConvSmall = g.pipe("shaders/conv3x3_smallc.spv");
-    const VkPipeline pConvCM = g.pipe("shaders/conv3x3_cm.spv");
+    auto cm_pipe = [&](int C) {            // 张量核变体按 C 选（conv3x3_cm.spv = C64）
+        std::string p = "shaders/conv3x3_cm";
+        if (C != 64) p += "_" + std::to_string(C);
+        return g.pipe(p + ".spv");
+    };
     const VkPipeline pShuffle = g.pipe("shaders/shuffle_prelu.spv");
     const VkPipeline pFinal = g.pipe("shaders/bilinear4_add_u8.spv");
     const VkPipeline pAdd = g.pipe("shaders/add.spv");
@@ -478,32 +496,39 @@ int main(int argc, char** argv) {
     };
 
     auto run_conv64 = [&](const std::string& name, Buf& in, VkDeviceSize in_off, Buf& out,
-                          VkDeviceSize out_off, int h, int w, int O, float slope) {
+                          VkDeviceSize out_off, int h, int w, float slope) {
         const WLayer& L = layers[idx[name]];
-        if (L.cm_off >= 0 && O % 64 == 0) {
-            // 张量核路径：C=64, O=64, 3x3；权重布局 [tap][C][O] f16
+        const int O = L.O;          // 输出通道一律来自清单，别在外面写死
+        if (L.cm_off >= 0) {
+            // 张量核路径：权重 [tap][cc][ocg][k][n] f16，O 补齐到 64 的倍数
             VkDescriptorBufferInfo dbi[4] = {{in.buf, in_off, VK_WHOLE_SIZE},
                                              {bwcm.buf, (VkDeviceSize)L.cm_off, VK_WHOLE_SIZE},
                                              {bw.buf, L.b_off, VK_WHOLE_SIZE},
                                              {out.buf, out_off, VK_WHOLE_SIZE}};
             Push pc;
-            pc.C_ = 64;
+            pc.C_ = L.C;
             pc.H = h;
             pc.W = w;
             pc.O = O;
             pc.slope = slope;
-            g.dispatch(pConvCM, dbi, pc, (uint32_t)((w + 31) / 32), (uint32_t)((h + 3) / 4), (uint32_t)(O / 64));
+            pc.k = (O + 63) / 64 * 64;
+            g.dispatch(cm_pipe(L.C), dbi, pc, (uint32_t)((w + 31) / 32), (uint32_t)((h + 3) / 4),
+                       (uint32_t)((O + 63) / 64));
             return;
         }
         VkDescriptorBufferInfo dbi[4];
         layer_bufs(name, 3, dbi, in, in_off, out, out_off, VK_WHOLE_SIZE);
         Push pc;
-        pc.C_ = 64;
+        pc.C_ = L.C;
         pc.H = h;
         pc.W = w;
         pc.O = O;
         pc.slope = slope;
-        g.dispatch(pConv64, dbi, pc, (uint32_t)((w + 7) / 8), (uint32_t)((h + 7) / 8), 1);
+        if (L.C == 64) {
+            g.dispatch(pConv64, dbi, pc, (uint32_t)((w + 7) / 8), (uint32_t)((h + 7) / 8), 1);
+        } else {
+            g.dispatch(pConvGen, dbi, pc, (uint32_t)(((size_t)h * w + 63) / 64));
+        }
     };
     auto run_convg = [&](const std::string& name, Buf& in, VkDeviceSize in_off, Buf& out,
                          VkDeviceSize out_off, int h, int w, float slope) {
@@ -544,7 +569,7 @@ int main(int argc, char** argv) {
         Buf* cout = &bp1;
         g.copy(bfeat, 0, *cin, 0, (VkDeviceSize)px * F * 4);
         for (int b = 0; b < 3; ++b) {
-            run_conv64("forward_" + std::to_string(b), *cin, 0, *cout, 0, Hh, Ww, 64, act);
+            run_conv64("forward_" + std::to_string(b), *cin, 0, *cout, 0, Hh, Ww, act);
             g.copy(*cout, 0, bfwd, (VkDeviceSize)b * px * F * 4, (VkDeviceSize)px * F * 4);
             std::swap(cin, cout);
         }
@@ -562,8 +587,8 @@ int main(int argc, char** argv) {
             long zeros_got = 0, zeros_ref = 0;
             for (int y = 0; y < Hh; ++y) {
                 for (int x = 0; x < Ww; ++x) {
-                    for (int c = 0; c < 64; ++c) {
-                        const size_t i = ((size_t)y * Ww + x) * 64 + c;
+                    for (int c = 0; c < (int)F; ++c) {
+                        const size_t i = ((size_t)y * Ww + x) * F + c;
                         const double d = std::fabs((double)got[i] - (double)ref[i]);
                         const int gx = (x % 32) / 16, gy = y % 2;
                         if (d > gmax[gy][gx]) gmax[gy][gx] = d;
@@ -582,7 +607,7 @@ int main(int argc, char** argv) {
     // 模型语义（注意两点）：
     //   1. feat_prop = Net20(feats[:, i] + feat_prop) —— "加 feat" 每帧只做一次；
     //   2. feat_prop 跨帧延续（上一帧的输出作为下一帧的 prop），只在序列开头清零。
-    const int nb = 20;
+    const int nb = jnb;
     Buf* scratch[2] = {&bp0, &bp1};
     auto run_dir = [&](bool forward, Buf& dst_all) {
         Buf* prop = scratch[0];
@@ -604,7 +629,7 @@ int main(int argc, char** argv) {
             for (int b = 0; b < nb; ++b) {
                 const std::string name =
                     (forward ? "forward_" : "backward_") + std::to_string(b);
-                run_conv64(name, *src, 0, *scratch[w], 0, Hh, Ww, 64, slope_act);
+                run_conv64(name, *src, 0, *scratch[w], 0, Hh, Ww, slope_act);
                 src = scratch[w];
                 w ^= 1;
             }
@@ -653,15 +678,15 @@ int main(int argc, char** argv) {
             dbi[2] = {bw.buf, 0, 1};
             dbi[3] = {bcat.buf, 0, VK_WHOLE_SIZE};
             Push pc;
-            pc.C_ = 64;
-            pc.H = 64;
+            pc.C_ = (int32_t)F;
+            pc.H = (int32_t)F;
             pc.W = (int32_t)px;
             g.dispatch(pCat, dbi, pc, (uint32_t)((px + 63) / 64));
         }
         run_convg("fusion", bcat, 0, bfused, 0, Hh, Ww, 0.0f);
 
-        // up1: conv 64->256 @ H,W  -> shuffle -> 64 @ 2H,2W
-        run_conv64("up1", bfused, 0, bconv1, 0, Hh, Ww, 256, 0.0f);
+        // up1: conv C->4F @ H,W -> shuffle -> F @ 2H,2W
+        run_conv64("up1", bfused, 0, bconv1, 0, Hh, Ww, 0.0f);
         {
             VkDescriptorBufferInfo dbi[4];
             dbi[0] = {bconv1.buf, 0, VK_WHOLE_SIZE};
@@ -669,14 +694,14 @@ int main(int argc, char** argv) {
             dbi[2] = {bw.buf, 0, 1};
             dbi[3] = {bup1.buf, 0, VK_WHOLE_SIZE};
             Push pc;
-            pc.C_ = 64;
+            pc.C_ = (int32_t)F;
             pc.H = Hh;
             pc.W = Ww;
             pc.slope = prelu1;
             g.dispatch(pShuffle, dbi, pc, (uint32_t)((Ww + 15) / 16), (uint32_t)Hh);
         }
-        // up2: conv 64->128 @ 2H,2W -> shuffle -> 32 @ 4H,4W
-        run_conv64("up2", bup1, 0, bconv2, 0, Hh * 2, Ww * 2, 128, 0.0f);
+        // up2: conv 4F->128 @ 2H,2W -> shuffle -> 32 @ 4H,4W
+        run_conv64("up2", bup1, 0, bconv2, 0, Hh * 2, Ww * 2, 0.0f);
         {
             VkDescriptorBufferInfo dbi[4];
             dbi[0] = {bconv2.buf, 0, VK_WHOLE_SIZE};
@@ -684,7 +709,7 @@ int main(int argc, char** argv) {
             dbi[2] = {bw.buf, 0, 1};
             dbi[3] = {bup2.buf, 0, VK_WHOLE_SIZE};
             Push pc;
-            pc.C_ = 32;
+            pc.C_ = clC;
             pc.H = Hh * 2;
             pc.W = Ww * 2;
             pc.slope = prelu2;
@@ -708,7 +733,7 @@ int main(int argc, char** argv) {
     g.submit_wait();
 
     // ---- 对拍 ----
-    std::printf("逐级对拍（fp32 参考，容差 2e-2）:\n");
+    std::printf("逐级对拍（fp32 参考，容差 2e-2 或相对 5e-3）:\n");
     auto cmp_buf = [&](const char* tag, const char* file, Buf& b, size_t n, double tol,
                        size_t byte_off = 0) {
         auto ref = load_bin(S + file, n);
@@ -758,7 +783,7 @@ int main(int argc, char** argv) {
                 Buf* nxt = &bp1;
                 for (int b = 0; b < nb; ++b) {
                     run_conv64("forward_" + std::to_string(b), bfeat, (VkDeviceSize)t * px * F * 4,
-                               *nxt, 0, Hh, Ww, 64, slope_act);
+                               *nxt, 0, Hh, Ww, slope_act);
                     std::swap(cur, nxt);
                 }
             }

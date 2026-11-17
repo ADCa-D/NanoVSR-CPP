@@ -1,0 +1,64 @@
+nanovsr build Nov 17 2026 13:15:28
+输入: kn_in.mp4  854x480  30.000 fps
+输出分辨率: 3416x1920
+模型: num_feat=64, blocks=20
+GPU: NVIDIA GeForce RTX 5060 Laptop GPU
+preset: balanced  (chunk 30, budget 驱动建议 x0.8, crf 18)
+显存账本：预算 5.98 GB（驱动建议 x0.8）
+  权重                10.2 MB  (固定)
+  静态 tile 缓冲    1300.6 MB  (9.2 KB/px x 138 k px)
+  时间维缓冲        3798.8 MB  (0.89 KB/px/帧 x 30 帧)
+  ── 合计             5.11 GB / 5.98 GB  (余 872 MB)
+→ tile 288x480（overlap 96），分块 4 块，单块最大 138 k 像素
+  总处理量 0.55 M 像素/帧（帧本身 0.41 M，放大 1.35x）
+张量核 shader: shaders/conv3x3_cm_64.spv
+Svt[info]: -------------------------------------------
+Svt[info]: SVT [version]:	SVT-AV1 Encoder Lib v4.2.0-72-gae2658e53
+Svt[info]: SVT [build]  :	GCC 16.1.0	 64 bit
+Svt[info]: LIB Build date: Aug  9 2026 11:41:54
+Svt[info]: -------------------------------------------
+Svt[info]: Level of Parallelism: 4
+Svt[info]: Number of PPCS 107
+Svt[info]: [asm level on system : up to avx512icl]
+Svt[info]: [asm level selected : up to avx512icl]
+Svt[info]: -------------------------------------------
+Svt[info]: SVT [config]: main profile	tier (auto)	level (auto)
+Svt[info]: SVT [config]: width / height / fps numerator / fps denominator 		: 64 / 64 / 25 / 1
+Svt[info]: SVT [config]: bit-depth / color format 					: 8 / YUV420
+Svt[info]: SVT [config]: preset / tune / pred struct 					: 4 / PSNR / random access
+Svt[info]: SVT [config]: gop size / mini-gop size / key-frame type 			: 161 / 32 / key frame
+Svt[info]: SVT [config]: BRC mode / rate factor 					: CRF / 23.00 
+Svt[info]: SVT [config]: AQ mode / Variance Boost 					: 2 / 0
+Svt[info]: SVT [config]: sharpness / luminance-based QP bias 				: 0 / 0
+Svt[info]: SVT [config]: QP scale compress strength 					: 0
+Svt[info]: -------------------------------------------
+编码器: -c:v libsvtav1 -crf 23 -preset 4 -svtav1-params lp=4
+Svt[info]: -------------------------------------------
+Svt[info]: SVT [version]:	SVT-AV1 Encoder Lib v4.2.0-72-gae2658e53
+Svt[info]: SVT [build]  :	GCC 16.1.0	 64 bit
+Svt[info]: LIB Build date: Aug  9 2026 11:41:54
+Svt[info]: -------------------------------------------
+Svt[info]: Level of Parallelism: 4
+Svt[info]: Number of PPCS 107
+Svt[info]: [asm level on system : up to avx512icl]
+Svt[info]: [asm level selected : up to avx512icl]
+Svt[info]: -------------------------------------------
+Svt[info]: SVT [config]: main profile	tier (auto)	level (auto)
+Svt[info]: SVT [config]: width / height / fps numerator / fps denominator 		: 3416 / 1920 / 30 / 1
+Svt[info]: SVT [config]: bit-depth / color format 					: 8 / YUV420
+Svt[info]: SVT [config]: preset / tune / pred struct 					: 4 / PSNR / random access
+Svt[info]: SVT [config]: gop size / mini-gop size / key-frame type 			: 161 / 32 / key frame
+Svt[info]: SVT [config]: BRC mode / rate factor 					: CRF / 23.00 
+Svt[info]: SVT [config]: AQ mode / Variance Boost 					: 2 / 0
+Svt[info]: SVT [config]: sharpness / luminance-based QP bias 				: 0 / 0
+Svt[info]: SVT [config]: QP scale compress strength 					: 0
+Svt[info]: -------------------------------------------
+处理 6 帧  1.71 fps  [tile 4/4]
+完成: 6 帧
+[vost#0:0/rawvideo @ 000002d3d7557040] Error submitting a packet to the muxer: Broken pipe
+    Last message repeated 1 times
+[out#0/rawvideo @ 000002d3d535f4c0] Error muxing a packet
+[out#0/rawvideo @ 000002d3d535f4c0] Task finished with error code: -32 (Broken pipe)
+[out#0/rawvideo @ 000002d3d535f4c0] Terminating thread with return code -32 (Broken pipe)
+[out#0/rawvideo @ 000002d3d535f4c0] Error writing trailer: Broken pipe
+[out#0/rawvideo @ 000002d3d535f4c0] Error closing file: Broken pipe

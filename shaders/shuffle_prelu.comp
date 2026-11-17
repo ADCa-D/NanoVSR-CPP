@@ -29,7 +29,7 @@ layout(push_constant) uniform P {
     int k;            // 未用
 } p;
 
-shared float s[TILEX * 4 * 64];      // 最大 C=64 -> 16*256
+shared float s[TILEX * 4 * 96];      // 最大 C=96 -> 16*384（C=64 时只需 16*256）
 
 void main() {
     const int C = p.C_;

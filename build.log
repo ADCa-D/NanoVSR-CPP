@@ -1,0 +1,24 @@
+[1/3] GLSL to SPIR-V
+shaders\conv3x3_c64.comp
+shaders\conv3x3_smallc.comp
+shaders\conv_gen.comp
+shaders\shuffle_prelu.comp
+shaders\shuffle_prelu.comp
+shaders\bilinear4_add_u8.comp
+shaders\add.comp
+shaders\cat2.comp
+shaders\u8rgb_to_f32.comp
+shaders\copy.comp
+shaders\conv3x3_cm.comp
+shaders\conv3x3_cm.comp
+shaders\conv3x3_cm.comp
+shaders\conv3x3_cm.comp
+shaders\conv3x3_cm.comp
+shaders\conv3x3_cm.comp
+shaders\conv3x3_cm.comp
+[2/3] C++ (unit tests)
+vk_conv_test.cpp
+[3/3] C++ (model test / bench / main)
+model_test.cpp
+bench_model.cpp
+nanovsr.cpp

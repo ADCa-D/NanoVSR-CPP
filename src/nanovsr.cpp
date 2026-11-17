@@ -579,9 +579,6 @@ int main(int argc, char** argv) {
     const size_t F = (size_t)nf_;
     const int nb = nb_;
     std::printf("模型: num_feat=%d, blocks=%d\n", (int)F, nb);
-    if (std::string(model_dir).find("1.7m") == std::string::npos) {
-        std::printf("!! 警告: 644k / 5.4m 的 C!=64 路径尚未验证（与 torch 差 ~32 dB），仅供实验\n");
-    }
 
     const float act = 0.1f;
 
@@ -771,10 +768,14 @@ int main(int argc, char** argv) {
     const VkPipeline pConvSmall = g.pipe("shaders/conv3x3_smallc.spv");
         // 张量核 shader 按 num_feat 编译了变体（C 是编译期常量）
     std::string cm_path = "shaders/conv3x3_cm_" + std::to_string((int)F) + ".spv";
-    if (!std::ifstream(cm_path).good()) cm_path = "shaders/conv3x3_cm.spv";
-    std::printf("张量核 shader: %s", cm_path.c_str());
-    const VkPipeline pConvCM = g.pipe(cm_path);
     std::string cm16_path = "shaders/conv3x3_cm_" + std::to_string((int)F) + "_f16.spv";
+    if (!std::ifstream(cm_path).good() || !std::ifstream(cm16_path).good()) {
+        std::printf("缺少张量核变体: %s / %s（build.bat 按 num_feat 生成，C=%d）\n",
+                    cm_path.c_str(), cm16_path.c_str(), (int)F);
+        return 1;   // 宁可启动失败，也不要静默套用 C=64 的错内核
+    }
+    std::printf("张量核 shader: %s\n", cm_path.c_str());
+    const VkPipeline pConvCM = g.pipe(cm_path);
     const VkPipeline pConvCM16 = g.pipe(cm16_path);
     const VkPipeline pShuffle16 = g.pipe("shaders/shuffle_prelu_f16.spv");
     const VkPipeline pShuffle = g.pipe("shaders/shuffle_prelu.spv");
@@ -786,13 +787,14 @@ int main(int argc, char** argv) {
     auto run_conv64 = [&](const std::string& name, Buf& in, VkDeviceSize in_off, Buf& out,
                           VkDeviceSize out_off, int h, int w, int O, float slope, bool out_f16 = false) {
         const WLayer& L = layers[idx[name]];
+        if (name == "forward_0") std::printf("[diag] %s cm_off=%d C=%d O=%d -> %s\n", name.c_str(), L.cm_off, L.C, O, (L.cm_off >= 0) ? "CM" : "SIMT");
         if (L.cm_off >= 0) {
             VkDescriptorBufferInfo dbi[4] = {{in.buf, in_off, VK_WHOLE_SIZE},
                                              {bwcm.buf, (VkDeviceSize)L.cm_off, VK_WHOLE_SIZE},
                                              {bw.buf, L.b_off, VK_WHOLE_SIZE},
                                              {out.buf, out_off, VK_WHOLE_SIZE}};
             Push pc;
-            pc.C_ = 64;
+            pc.C_ = (int)F;
             pc.H = h;
             pc.W = w;
             pc.O = O;
@@ -807,12 +809,17 @@ int main(int argc, char** argv) {
                                          {bw.buf, L.b_off, VK_WHOLE_SIZE},
                                          {out.buf, out_off, VK_WHOLE_SIZE}};
         Push pc;
-        pc.C_ = 64;
+        pc.C_ = (int)F;
         pc.H = h;
         pc.W = w;
         pc.O = O;
         pc.slope = slope;
-        g.dispatch(pConv64, dbi, pc, (uint32_t)((w + 7) / 8), (uint32_t)((h + 7) / 8), 1);
+        if ((int)F == 64) {
+            g.dispatch(pConv64, dbi, pc, (uint32_t)((w + 7) / 8), (uint32_t)((h + 7) / 8), 1);
+        } else {
+            // 通用 shader 按 p.C_ 循环，C != 64 时唯一正确的兜底
+            g.dispatch(pConvGen, dbi, pc, (uint32_t)(((size_t)h * w + 63) / 64));
+        }
     };
     auto run_convg = [&](const std::string& name, Buf& in, VkDeviceSize in_off, Buf& out,
                          VkDeviceSize out_off, int h, int w, float slope) {
@@ -973,7 +980,7 @@ int main(int argc, char** argv) {
                 for (int b = 0; b < nb; ++b) {
                     const std::string name =
                         (forward ? "forward_" : "backward_") + std::to_string(b);
-                    run_conv64(name, *src, 0, *scratch[w], 0, H, W, 64, act);
+                    run_conv64(name, *src, 0, *scratch[w], 0, H, W, (int)F, act);
                     src = scratch[w];
                     w ^= 1;
                 }
@@ -1013,7 +1020,7 @@ int main(int argc, char** argv) {
                                                 {bw.buf, 0, 1},
                                                 {bup1.buf, 0, VK_WHOLE_SIZE}};
                 Push p2;
-                p2.C_ = 64;
+                p2.C_ = (int)F;
                 p2.H = H;
                 p2.W = W;
                 p2.slope = prelu1;

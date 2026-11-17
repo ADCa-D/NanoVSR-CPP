@@ -314,6 +314,8 @@ int main(int argc, char** argv) {
     };
     size_t shape = js.find("\"shape\"");
     int T0 = jint("T", shape), Hh = jint("H", shape), Ww = jint("W", shape);
+    int jFb = jint("num_feat", 0);          // 64 / 48 / 96
+    int jnbb = jint("num_blocks", 0);       // 20 / 12 / 30（老清单可能没有）
 
     std::vector<WLayer> layers;
     std::map<std::string, int> idx;
@@ -343,6 +345,10 @@ int main(int argc, char** argv) {
             p = pe;
         }
     }
+    if (jnbb <= 0) {                       // 老版清单没有 num_blocks，按层名兜底
+        for (const auto& kv : idx)
+            if (kv.first.rfind("forward_", 0) == 0) ++jnbb;
+    }
     const int T = frames_arg > 0 ? frames_arg : T0;
     std::printf("T=%d H=%d W=%d  层数 %zu\n", T, Hh, Ww, layers.size());
 
@@ -355,7 +361,10 @@ int main(int argc, char** argv) {
     Buf bwcm = g.alloc(cmblob.size());
     std::memcpy(bwcm.mapped, cmblob.data(), cmblob.size());
 
-    const size_t F = 64;
+    const size_t F = (size_t)jFb;
+    const int up1O = layers[idx["up1"]].O;        // 4F
+    const int up2O = layers[idx["up2"]].O;        // 128
+    const int clC = layers[idx["conv_last"]].C;   // 32
     const size_t px = (size_t)Hh * Ww;
     Buf bx = g.alloc((VkDeviceSize)T * px * 3 * 4);
     Buf bfeat = g.alloc((VkDeviceSize)T * px * F * 4);
@@ -366,10 +375,10 @@ int main(int argc, char** argv) {
     Buf bcatus = g.alloc((VkDeviceSize)px * F * 4);
     Buf bcat = g.alloc((VkDeviceSize)px * 2 * F * 4);
     Buf bfused = g.alloc((VkDeviceSize)px * F * 4);
-    Buf bconv1 = g.alloc((VkDeviceSize)px * 4 * 256 * 4);
+    Buf bconv1 = g.alloc((VkDeviceSize)px * 4 * (size_t)up1O * 4);
     Buf bup1 = g.alloc((VkDeviceSize)px * 4 * F * 4);
-    Buf bconv2 = g.alloc((VkDeviceSize)px * 16 * 128 * 4);
-    Buf bup2 = g.alloc((VkDeviceSize)px * 16 * 32 * 4);
+    Buf bconv2 = g.alloc((VkDeviceSize)px * 16 * (size_t)up2O * 4);
+    Buf bup2 = g.alloc((VkDeviceSize)px * 16 * (size_t)clC * 4);
     Buf blast = g.alloc((VkDeviceSize)px * 16 * 3 * 4);
     Buf bout = g.alloc((VkDeviceSize)T * px * 16 * 4);
 
@@ -383,27 +392,33 @@ int main(int argc, char** argv) {
     const VkPipeline pConv64 = g.pipe("shaders/conv3x3_c64.spv");
     const VkPipeline pConvGen = g.pipe("shaders/conv_gen.spv");
     const VkPipeline pConvSmall = g.pipe("shaders/conv3x3_smallc.spv");
-    const VkPipeline pConvCM = g.pipe("shaders/conv3x3_cm.spv");
+    auto cm_pipe = [&](int C) {            // 张量核变体按 C 选（conv3x3_cm.spv = C64）
+        std::string p = "shaders/conv3x3_cm";
+        if (C != 64) p += "_" + std::to_string(C);
+        return g.pipe(p + ".spv");
+    };
     const VkPipeline pShuffle = g.pipe("shaders/shuffle_prelu.spv");
     const VkPipeline pFinal = g.pipe("shaders/bilinear4_add_u8.spv");
     const VkPipeline pAdd = g.pipe("shaders/add.spv");
     const VkPipeline pCat = g.pipe("shaders/cat2.spv");
 
     auto run_conv64 = [&](const std::string& name, Buf& in, VkDeviceSize in_off, Buf& out,
-                          VkDeviceSize out_off, int h, int w, int O, float slope) {
+                          VkDeviceSize out_off, int h, int w, float slope) {
         const WLayer& L = layers[idx[name]];
-        if (L.cm_off >= 0 && O % 64 == 0) {
+        const int O = L.O;
+        if (L.cm_off >= 0) {
             VkDescriptorBufferInfo dbi[4] = {{in.buf, in_off, VK_WHOLE_SIZE},
                                              {bwcm.buf, (VkDeviceSize)L.cm_off, VK_WHOLE_SIZE},
                                              {bw.buf, L.b_off, VK_WHOLE_SIZE},
                                              {out.buf, out_off, VK_WHOLE_SIZE}};
             Push pc;
-            pc.C_ = 64;
+            pc.C_ = L.C;
             pc.H = h;
             pc.W = w;
             pc.O = O;
             pc.slope = slope;
-            g.dispatch(pConvCM, dbi, pc, (uint32_t)((w + 31) / 32), (uint32_t)((h + 3) / 4), (uint32_t)(O / 64));
+            pc.k = (O + 63) / 64 * 64;
+            g.dispatch(cm_pipe(L.C), dbi, pc, (uint32_t)((w + 31) / 32), (uint32_t)((h + 3) / 4), (uint32_t)((O + 63) / 64));
             return;
         }
         VkDescriptorBufferInfo dbi[4] = {{in.buf, in_off, VK_WHOLE_SIZE},
@@ -411,12 +426,15 @@ int main(int argc, char** argv) {
                                          {bw.buf, L.b_off, VK_WHOLE_SIZE},
                                          {out.buf, out_off, VK_WHOLE_SIZE}};
         Push pc;
-        pc.C_ = 64;
+        pc.C_ = L.C;
         pc.H = h;
         pc.W = w;
         pc.O = O;
         pc.slope = slope;
-        g.dispatch(pConv64, dbi, pc, (uint32_t)((w + 7) / 8), (uint32_t)((h + 7) / 8), 1);
+        if (L.C == 64)
+            g.dispatch(pConv64, dbi, pc, (uint32_t)((w + 7) / 8), (uint32_t)((h + 7) / 8), 1);
+        else
+            g.dispatch(pConvGen, dbi, pc, (uint32_t)(((size_t)h * w + 63) / 64));
     };
     auto run_convg = [&](const std::string& name, Buf& in, VkDeviceSize in_off, Buf& out,
                          VkDeviceSize out_off, int h, int w, float slope) {
@@ -441,7 +459,7 @@ int main(int argc, char** argv) {
     };
 
     const float act = 0.1f;
-    const int nb = 20;
+    const int nb = jnbb;
     const int reps = std::max(3, T) + 1;      // 第 1 轮只做预热（驱动首次 dispatch 会 JIT）
     double acc[8] = {0};
 
@@ -474,7 +492,7 @@ int main(int argc, char** argv) {
                 for (int b = 0; b < nb; ++b) {
                     const std::string name =
                         (forward ? "forward_" : "backward_") + std::to_string(b);
-                    run_conv64(name, *src, 0, *scratch[w], 0, Hh, Ww, 64, act);
+                    run_conv64(name, *src, 0, *scratch[w], 0, Hh, Ww, act);
                     src = scratch[w];
                     w ^= 1;
                 }
@@ -507,8 +525,8 @@ int main(int argc, char** argv) {
                     {bw.buf, 0, 1},
                     {bcat.buf, 0, VK_WHOLE_SIZE}};
                 Push pc;
-                pc.C_ = 64;
-                pc.H = 64;
+                pc.C_ = (int32_t)F;
+                pc.H = (int32_t)F;
                 pc.W = (int32_t)px;
                 g.dispatch(pCat, dbi, pc, (uint32_t)((px + 63) / 64));
             }
@@ -516,7 +534,7 @@ int main(int argc, char** argv) {
             g.submit_wait();
             double a3 = now_ms();
             g.begin();
-            run_conv64("up1", bfused, 0, bconv1, 0, Hh, Ww, 256, 0.0f);
+            run_conv64("up1", bfused, 0, bconv1, 0, Hh, Ww, 0.0f);
             g.submit_wait();
             m[0] = now_ms() - a3;
             a3 = now_ms();
@@ -527,7 +545,7 @@ int main(int argc, char** argv) {
                                                  {bw.buf, 0, 1},
                                                  {bup1.buf, 0, VK_WHOLE_SIZE}};
                 Push pc;
-                pc.C_ = 64;
+                pc.C_ = (int32_t)F;
                 pc.H = Hh;
                 pc.W = Ww;
                 pc.slope = 0.0263f;
@@ -537,7 +555,7 @@ int main(int argc, char** argv) {
             m[1] = now_ms() - a3;
             a3 = now_ms();
             g.begin();
-            run_conv64("up2", bup1, 0, bconv2, 0, Hh * 2, Ww * 2, 128, 0.0f);
+            run_conv64("up2", bup1, 0, bconv2, 0, Hh * 2, Ww * 2, 0.0f);
             g.submit_wait();
             m[2] = now_ms() - a3;
             a3 = now_ms();
@@ -548,7 +566,7 @@ int main(int argc, char** argv) {
                                                  {bw.buf, 0, 1},
                                                  {bup2.buf, 0, VK_WHOLE_SIZE}};
                 Push pc;
-                pc.C_ = 32;
+                pc.C_ = clC;
                 pc.H = Hh * 2;
                 pc.W = Ww * 2;
                 pc.slope = 0.0393f;
@@ -599,19 +617,20 @@ int main(int argc, char** argv) {
                        (acc[3] / reps_ok);
     std::printf("\n平均（%d 轮，T=%d，不含预热）:\n", reps_ok, T);
     std::printf("  feat     %7.2f ms/帧\n", acc[0] / reps_ok / T);
-    std::printf("  forward  %7.2f ms/帧   (20 层)\n", acc[1] / reps_ok / T);
-    std::printf("  backward %7.2f ms/帧   (20 层)\n", acc[2] / reps_ok / T);
+    std::printf("  forward  %7.2f ms/帧   (%d 层)\n", acc[1] / reps_ok / T, jnbb);
+    std::printf("  backward %7.2f ms/帧   (%d 层)\n", acc[2] / reps_ok / T, jnbb);
     std::printf("  up+out   %7.2f ms/帧   (fusion/up1/up2/conv_last/bilinear)\n", acc[3] / reps_ok);
     std::printf("  合计     %7.2f ms/帧  -> %.1f FPS\n", per_frame, 1000.0 / per_frame);
 
     // 理论计算量（用于算实测 TFLOPS）
-    const double conv1_g = 2.0 * 64 * 64 * 9.0 * px / 1e9;
-    const double gflop = conv1_g * 40                                   // 40 个 block
-                         + 2.0 * 3 * 64 * 9.0 * px / 1e9                // feat
-                         + 2.0 * 128 * 64 * px / 1e9                    // fusion 1x1
-                         + 2.0 * 64 * 256 * 9.0 * px / 1e9              // up1
-                         + 2.0 * 64 * 128 * 9.0 * px * 4 / 1e9          // up2
-                         + 2.0 * 32 * 3 * 9.0 * px * 16 / 1e9;          // conv_last
+    const double Fv = (double)F, u1 = (double)up1O, u2 = (double)up2O, cl = (double)clC;
+    const double conv1_g = 2.0 * Fv * Fv * 9.0 * px / 1e9;
+    const double gflop = conv1_g * (2.0 * jnbb)                         // nb 个 forward + nb 个 backward
+                         + 2.0 * 3 * Fv * 9.0 * px / 1e9                // feat
+                         + 2.0 * (2.0 * Fv) * Fv * px / 1e9             // fusion 1x1
+                         + 2.0 * Fv * u1 * 9.0 * px / 1e9               // up1
+                         + 2.0 * u1 * u2 * 9.0 * px * 4 / 1e9           // up2 @ 2x2
+                         + 2.0 * cl * 3 * 9.0 * px * 16 / 1e9;          // conv_last @ 4x4
     std::printf("  计算量   %7.1f GFLOP/帧 -> 实测 %.2f TFLOPS\n", gflop,
                 gflop / (per_frame * 1e-3) / 1000.0);
 
@@ -624,18 +643,18 @@ int main(int argc, char** argv) {
         double a = now_ms();
         g.submit_wait();
         double ms = now_ms() - a;
-        double gf = 2.0 * 3 * 64 * 9.0 * px / 1e9;
+        double gf = 2.0 * 3 * Fv * 9.0 * px / 1e9;
         std::printf("\n微基准 feat_extract x40: %.2f ms/dispatch (single frame)  %.2f GFLOP -> %.2f TFLOPS\n",
                     ms / 40, gf, gf / (ms / 40 * 1e-3) / 1000.0);
 
         g.reset_pool();
         g.begin();
         for (int i = 0; i < 20; ++i)
-            run_conv64("forward_0", bfeat, 0, bp1, 0, Hh, Ww, 64, act);
+            run_conv64("forward_0", bfeat, 0, bp1, 0, Hh, Ww, act);
         a = now_ms();
         g.submit_wait();
         ms = now_ms() - a;
-        gf = 2.0 * 64 * 64 * 9.0 * px / 1e9;
+        gf = 2.0 * Fv * Fv * 9.0 * px / 1e9;
         std::printf("微基准 forward_0 x20: %.2f ms/dispatch  %.2f GFLOP -> %.2f TFLOPS\n", ms / 20,
                     gf, gf / (ms / 20 * 1e-3) / 1000.0);
     }
