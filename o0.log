@@ -1,0 +1,35 @@
+nanovsr build Nov 18 2026 21:28:53
+输入: kn_in.mp4  854x480  30.000 fps
+输出分辨率: 3416x1920
+模型: num_feat=48, blocks=12
+GPU: NVIDIA GeForce RTX 5060 Laptop GPU
+preset: balanced  (chunk 30, budget 驱动建议 x0.8, crf 0)
+计算通路: 张量核 cooperative matrix
+显存账本：预算 5.98 GB（驱动建议 x0.8）
+  权重                 4.2 MB  (固定)
+  静态 tile 缓冲     248.8 MB  (8.4 KB/px x 29 k px)
+  时间维缓冲         622.1 MB  (0.70 KB/px/帧 x 30 帧)
+  ── 合计             0.88 GB / 5.98 GB  (余 5107 MB)
+→ tile 200x144（overlap 0），分块 20 块，单块最大 29 k 像素
+  总处理量 0.58 M 像素/帧（帧本身 0.41 M，放大 1.41x）
+张量核 shader: shaders/conv3x3_cm_48.spv
+编码器: -c:v libx264 -crf 0 -preset veryfast
+分段落盘: o0.mp4.parts
+处理 1 帧  2.69 fps  [20 块/帧]
+时间分解（总墙钟 0.37 s，1 帧，2.7 fps）:
+  打包 u8->u32     1.1%     0.00 s
+  录制命令         1.0%     0.00 s
+  合成 u32->RGB    1.1%     0.00 s
+  等 GPU(fence)   34.6%     0.13 s
+  其余(读写编)    62.2%     0.23 s
+  → CPU 侧占比 3.2%（GPU 空转 = 等 GPU 占比），上限 34.6%
+完成: 1 帧
+
+拼接 1 个分段（共 1 帧）-> o0.mp4
+[vost#0:0/rawvideo @ 000001321b557040] Error submitting a packet to the muxer: Broken pipe
+    Last message repeated 1 times
+[out#0/rawvideo @ 000001321925d500] Error muxing a packet
+[out#0/rawvideo @ 000001321925d500] Task finished with error code: -32 (Broken pipe)
+[out#0/rawvideo @ 000001321925d500] Terminating thread with return code -32 (Broken pipe)
+[out#0/rawvideo @ 000001321925d500] Error writing trailer: Broken pipe
+[out#0/rawvideo @ 000001321925d500] Error closing file: Broken pipe

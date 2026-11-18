@@ -690,7 +690,7 @@ int main(int argc, char** argv) {
     int ov_arg = 0;                           // --ov：手工指定 tile 重叠像素（0=默认 96）
     double budget_arg_gb = 0.0;
     std::string downscale = "lanczos";
-    bool supersample = false;   // 默认让模型工作在交付分辨率（保住模型效果）；true=先跑满4x再缩   // libplacebo downscaler: spline36|sinc|mitchell|... / lanczos=CPU
+    bool supersample = true;    // 默认：模型 4x 跑满，输出端再缩（保锐度）；--no-supersample 走预缩放   // libplacebo downscaler: spline36|sinc|mitchell|... / lanczos=CPU
     std::string codec_pref = "auto";
     std::string max_out = "4k";       // 4k(8.9Mp, 稳) | 8k(33.2Mp, 需要能编 8K 的编码器)   // auto|av1|av1cpu|hevc|h264   // lanczos(CPU,快) | sinc(GPU,抗混叠更好)
     std::string preset = "balanced";
@@ -714,6 +714,7 @@ int main(int argc, char** argv) {
         else if (a == "--preset") preset = next();
         else if (a == "--downscale") downscale = next();
         else if (a == "--supersample") supersample = true;
+        else if (a == "--no-supersample") supersample = false;
         else if (a == "--codec") codec_pref = next();
         else if (a == "--max-out") max_out = next();
         else if (a == "--model") model_dir = next();
