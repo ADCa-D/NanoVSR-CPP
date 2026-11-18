@@ -39,3 +39,9 @@ __pycache__/
 _release/
 
 _t.sh
+_mnn/
+_ncnn/
+_trtbuild/
+*.onnx
+*.mnn
+*.param
