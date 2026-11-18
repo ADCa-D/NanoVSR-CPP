@@ -37,3 +37,5 @@ __pycache__/
 
 # release artifacts
 _release/
+
+_t.sh
