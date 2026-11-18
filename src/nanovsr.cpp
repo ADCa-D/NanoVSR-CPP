@@ -1120,10 +1120,10 @@ int main(int argc, char** argv) {
     // 5.4m 31），所以按 2*(nb+4) 自适应留 4 px 余量就够了。实测把固定 96 收窄到自适应值：
     // 1.7m 4.76 -> 4.06 s（-15%）、5.4m 9.04 -> 8.45 s（-6.5%），与 96 的输出差 69~73 dB
     // （maxabs 4），接缝不可见。--ov 可手工覆盖。
-    int ov = std::max(16, ov_arg > 0 ? ov_arg : 2 * (nb + 4));
+    int ov = ov_arg >= 0 ? ov_arg : 0;   // 纯卷积网络不需要跨块信息，默认 0
     // --ov 给大了（或帧本身很小）会让后面的步长退化成 1 像素、tile 数爆炸
     if (ov > std::min(W, H) / 2) {
-        const int ovc = std::max(16, std::min(W, H) / 2);
+        const int ovc = std::max(0, std::min(W, H) / 2);
         std::printf("注意: --ov %d 超过帧短边的一半，已收窄到 %d\n", ov, ovc);
         ov = ovc;
     }
